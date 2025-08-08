@@ -1,7 +1,8 @@
-// Optimizer.h
-#pragma once
-#include <Eigen/Dense>
+#ifndef OPTIMIZER_H
+#define OPTIMIZER_H
+
 #include <vector>
+#include <Eigen/Dense>
 #include "EDGraph.h"
 
 class Optimizer {
@@ -10,5 +11,8 @@ public:
                   Eigen::VectorXd& x_opt,
                   EDGraph& edgraph,
                   const std::vector<Eigen::Vector3d>& key_old,
-                  const std::vector<Eigen::Vector3d>& key_new);
+                  const std::vector<Eigen::Vector3d>& key_new,
+                  const std::vector<int>& key_indices);
 };
+
+#endif // OPTIMIZER_H

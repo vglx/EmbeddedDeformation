@@ -74,24 +74,26 @@ void pickUpKeypoints(const std::vector<Eigen::Vector3d>& pc,
     Eigen::Vector3d region_min = min_pt + delta * ((1 - region_percent) / 2);
     Eigen::Vector3d region_max = max_pt - delta * ((1 - region_percent) / 2);
 
-    key_old.clear();
-    key_indices.clear();
+    key_old.resize(6);
+    key_new.resize(6);
+    key_indices.resize(6);
+    for (int i = 0; i < 6; ++i) key_old[i] = pc[0];
     for (size_t i = 0; i < pc.size(); ++i) {
         const auto& p = pc[i];
         if ((p.array() >= region_min.array()).all() && (p.array() <= region_max.array()).all()) {
-            key_old.push_back(p);
-            key_indices.push_back(static_cast<int>(i));
+            if (p.z() > key_old[0].z()) { key_old[0] = p; key_indices[0] = static_cast<int>(i); }
+            if (p.z() < key_old[1].z()) { key_old[1] = p; key_indices[1] = static_cast<int>(i); }
+            if (p.y() > key_old[2].y()) { key_old[2] = p; key_indices[2] = static_cast<int>(i); }
+            if (p.y() < key_old[3].y()) { key_old[3] = p; key_indices[3] = static_cast<int>(i); }
+            if (p.x() > key_old[4].x()) { key_old[4] = p; key_indices[4] = static_cast<int>(i); }
+            if (p.x() < key_old[5].x()) { key_old[5] = p; key_indices[5] = static_cast<int>(i); }
         }
     }
 
-    key_new = key_old;
     std::default_random_engine rng;
     std::normal_distribution<double> dist(0.0, max_deform / 3);
-    for (auto& kp : key_new) {
-        kp.x() += dist(rng);
-        kp.y() += dist(rng);
-        kp.z() += dist(rng);
-    }
+    key_new = key_old;
+    key_new[0].z() += std::abs(dist(rng));
 }
 
 int main() {
@@ -146,7 +148,7 @@ int main() {
     optimizer.optimize(x0, x_opt, edgraph, key_old, key_new, key_indices);
     edgraph.updateFromStateVector(x_opt, 0);
 
-    // 7. 应用形变
+    // 7. 应用形变并输出
     std::vector<Eigen::Vector3d> deformed;
     deformed.reserve(verts.size());
     for (size_t i = 0; i < verts.size(); ++i) {
