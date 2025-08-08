@@ -3,26 +3,40 @@
 
 EDGraph::EDGraph(int K): K_(K) {}
 
-void EDGraph::initializeGraph(const std::vector<MeshModel::Vertex>& vertices, int grid_size) {
-    // uniformly sample on a grid in bounding box
-    Eigen::Vector3d min_pt(vertices[0].x, vertices[0].y, vertices[0].z);
-    Eigen::Vector3d max_pt = min_pt;
-    for (auto& v: vertices) {
-        Eigen::Vector3d p(v.x, v.y, v.z);
-        min_pt = min_pt.cwiseMin(p);
-        max_pt = max_pt.cwiseMax(p);
+void EDGraph::initializeGraph(const std::vector<MeshModel::Vertex>& vertices, double grid_size) {
+    std::unordered_map<VoxelKey, std::pair<Eigen::Vector3d,int>, VoxelHash, VoxelEq> voxel_map;
+    voxel_map.reserve(vertices.size() / 10);
+
+    // Accumulate points per voxel
+    for (const auto& v : vertices) {
+        VoxelKey key{
+            static_cast<int>(std::floor(v.x / grid_size)),
+            static_cast<int>(std::floor(v.y / grid_size)),
+            static_cast<int>(std::floor(v.z / grid_size))
+        };
+        Eigen::Vector3d pt(v.x, v.y, v.z);
+        auto& entry = voxel_map[key];
+        if (entry.second == 0) {
+            entry.first = pt;
+            entry.second = 1;
+        } else {
+            entry.first += pt;
+            entry.second += 1;
+        }
     }
-    Eigen::Vector3d extent = max_pt - min_pt;
-    int nx = std::max(1, int(extent.x() / grid_size));
-    int ny = std::max(1, int(extent.y() / grid_size));
-    int nz = std::max(1, int(extent.z() / grid_size));
-    graph_.clear();
-    for (int i = 0; i <= nx; ++i)
-    for (int j = 0; j <= ny; ++j)
-    for (int k = 0; k <= nz; ++k) {
-        Eigen::Vector3d pos = min_pt + Eigen::Vector3d(i * grid_size, j * grid_size, k * grid_size);
-        graph_.push_back({pos, Sophus::SE3d()});
+
+    // Create nodes from voxel centroids
+    std::vector<DeformationNode> nodes;
+    nodes.reserve(voxel_map.size());
+    for (auto& kv : voxel_map) {
+        auto centroid = kv.second.first / kv.second.second;
+        DeformationNode node;
+        node.position = centroid;
+        node.transform = Sophus::SE3d();
+        nodes.push_back(node);
     }
+
+    setGraphNodes(nodes);
     bindVertices(vertices);
 }
 
@@ -31,29 +45,33 @@ void EDGraph::setGraphNodes(const std::vector<DeformationNode>& nodes) {
 }
 
 void EDGraph::bindVertices(const std::vector<MeshModel::Vertex>& vertices) {
-    int n = vertices.size();
+    size_t n = vertices.size();
     bindings_.assign(n, {});
     weights_.assign(n, {});
-    double sigma = 10.0; // e.g. grid_size/2
-    for (int i = 0; i < n; ++i) {
-        Eigen::Vector3d p(vertices[i].x, vertices[i].y, vertices[i].z);
-        std::vector<std::pair<int,double>> dist_idx;
-        for (int j = 0; j < graph_.size(); ++j) {
-            double d = (p - graph_[j].position).norm();
-            dist_idx.emplace_back(j, d);
+
+    for (size_t i = 0; i < n; ++i) {
+        Eigen::Vector3d v(vertices[i].x, vertices[i].y, vertices[i].z);
+        std::vector<std::pair<int,double>> dists;
+        dists.reserve(graph_.size());
+        for (int j = 0; j < (int)graph_.size(); ++j) {
+            double dist = (v - graph_[j].position).norm();
+            dists.emplace_back(j, dist);
         }
-        std::sort(dist_idx.begin(), dist_idx.end(), [](auto&a,auto&b){return a.second<b.second;});
-        int kth = std::min(K_, (int)dist_idx.size());
+        std::sort(dists.begin(), dists.end(), [](auto &a, auto &b){return a.second < b.second;});
+
+        int kth = std::min(K_, (int)dists.size());
         bindings_[i].resize(kth);
         weights_[i].resize(kth);
-        double sum=0;
-        for(int k=0;k<kth;++k){
-            bindings_[i][k] = dist_idx[k].first;
-            double w = std::exp(-dist_idx[k].second*dist_idx[k].second/(2*sigma*sigma));
+        double sumw = 0;
+        for (int k = 0; k < kth; ++k) {
+            bindings_[i][k] = dists[k].first;
+            double w = 1.0 - dists[k].second / dists[kth].second;
             weights_[i][k] = w;
-            sum += w;
+            sumw += w;
         }
-        for(auto &w:weights_[i]) w/=sum;
+        for (int k = 0; k < kth; ++k) {
+            weights_[i][k] /= sumw;
+        }
     }
 }
 
