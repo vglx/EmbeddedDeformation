@@ -15,9 +15,9 @@ struct DeformationNode {
 
 class EDGraph {
 public:
-    explicit EDGraph(int K = 4);
+    explicit EDGraph(int K = 6);
 
-    void initializeGraph(const std::vector<MeshModel::Vertex>& mesh_vertices, int sampling_step = 10);
+    void initializeGraph(const std::vector<MeshModel::Vertex>& mesh_vertices, int grid_size);
 
     // 设置节点集合（rest positions + initial transforms）
     void setGraphNodes(const std::vector<DeformationNode>& nodes);

@@ -3,19 +3,27 @@
 
 EDGraph::EDGraph(int K): K_(K) {}
 
-void EDGraph::initializeGraph(const std::vector<MeshModel::Vertex>& vertices, int sampling_step) {
-    std::vector<DeformationNode> nodes;
-    nodes.reserve(vertices.size() / sampling_step + 1);
-
-    for (size_t i = 0; i < vertices.size(); i += sampling_step) {
-        const auto& v = vertices[i];
-        DeformationNode node;
-        node.position = Eigen::Vector3d(v.x, v.y, v.z);
-        node.transform = Sophus::SE3d();  // 默认单位变换
-        nodes.push_back(node);
+void EDGraph::initializeGraph(const std::vector<MeshModel::Vertex>& vertices, int grid_size) {
+    // uniformly sample on a grid in bounding box
+    Eigen::Vector3d min_pt(vertices[0].x, vertices[0].y, vertices[0].z);
+    Eigen::Vector3d max_pt = min_pt;
+    for (auto& v: vertices) {
+        Eigen::Vector3d p(v.x, v.y, v.z);
+        min_pt = min_pt.cwiseMin(p);
+        max_pt = max_pt.cwiseMax(p);
     }
-    setGraphNodes(nodes);           // 设置类内部 nodes_
-    bindVertices(vertices);    // 绑定顶点 -> 控制点
+    Eigen::Vector3d extent = max_pt - min_pt;
+    int nx = std::max(1, int(extent.x() / grid_size));
+    int ny = std::max(1, int(extent.y() / grid_size));
+    int nz = std::max(1, int(extent.z() / grid_size));
+    graph_.clear();
+    for (int i = 0; i <= nx; ++i)
+    for (int j = 0; j <= ny; ++j)
+    for (int k = 0; k <= nz; ++k) {
+        Eigen::Vector3d pos = min_pt + Eigen::Vector3d(i * grid_size, j * grid_size, k * grid_size);
+        graph_.push_back({pos, Sophus::SE3d()});
+    }
+    bindVertices(vertices);
 }
 
 void EDGraph::setGraphNodes(const std::vector<DeformationNode>& nodes) {
@@ -23,33 +31,29 @@ void EDGraph::setGraphNodes(const std::vector<DeformationNode>& nodes) {
 }
 
 void EDGraph::bindVertices(const std::vector<MeshModel::Vertex>& vertices) {
-    size_t n = vertices.size();
+    int n = vertices.size();
     bindings_.assign(n, {});
     weights_.assign(n, {});
-
-    for (size_t i = 0; i < n; ++i) {
-        Eigen::Vector3d v(vertices[i].x, vertices[i].y, vertices[i].z);
-        std::vector<std::pair<int, double>> dists;
-        dists.reserve(graph_.size());
-        for (int j = 0; j < (int)graph_.size(); ++j) {
-            double dist = (v - graph_[j].position).norm();
-            dists.emplace_back(j, dist);
+    double sigma = 10.0; // e.g. grid_size/2
+    for (int i = 0; i < n; ++i) {
+        Eigen::Vector3d p(vertices[i].x, vertices[i].y, vertices[i].z);
+        std::vector<std::pair<int,double>> dist_idx;
+        for (int j = 0; j < graph_.size(); ++j) {
+            double d = (p - graph_[j].position).norm();
+            dist_idx.emplace_back(j, d);
         }
-        std::sort(dists.begin(), dists.end(), [](auto& a, auto& b) {
-            return a.second < b.second;
-        });
-
-        double sum = 0.0;
-        int kth = std::min(K_, (int)dists.size());
+        std::sort(dist_idx.begin(), dist_idx.end(), [](auto&a,auto&b){return a.second<b.second;});
+        int kth = std::min(K_, (int)dist_idx.size());
         bindings_[i].resize(kth);
         weights_[i].resize(kth);
-        for (int k = 0; k < kth; ++k) {
-            bindings_[i][k] = dists[k].first;
-            double w = 1.0 / (dists[k].second + 1e-8);
+        double sum=0;
+        for(int k=0;k<kth;++k){
+            bindings_[i][k] = dist_idx[k].first;
+            double w = std::exp(-dist_idx[k].second*dist_idx[k].second/(2*sigma*sigma));
             weights_[i][k] = w;
             sum += w;
         }
-        for (double& w : weights_[i]) w /= sum;
+        for(auto &w:weights_[i]) w/=sum;
     }
 }
 
