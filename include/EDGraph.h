@@ -26,6 +26,11 @@ public:
     // 返回变形后的顶点，vidx 为顶点索引
     Eigen::Vector3d deformVertex(const MeshModel::Vertex& vertex, int vidx) const;
 
+    Eigen::Vector3d deformVertexByState(const Eigen::Vector3d& v,
+                                    const Eigen::VectorXd& x,
+                                    int vidx,
+                                    int offset = 0) const;
+
     // 将 state vector 中的 SE3 变量写入 graph
     void updateFromStateVector(const Eigen::VectorXd& x, int offset);
     // 将 graph 当前 SE3 写入 state vector

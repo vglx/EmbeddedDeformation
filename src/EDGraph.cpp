@@ -70,6 +70,25 @@ Eigen::Vector3d EDGraph::deformVertex(const MeshModel::Vertex& vertex, int vidx)
     return result;
 }
 
+Eigen::Vector3d EDGraph::deformVertexByState(const Eigen::Vector3d& v,
+                                             const Eigen::VectorXd& x,
+                                             int vidx,
+                                             int offset) const {
+    Eigen::Vector3d result(0, 0, 0);
+    const auto& node_ids = bindings_[vidx];
+    const auto& node_ws = weights_[vidx];
+    for (size_t k = 0; k < node_ids.size(); ++k) {
+        int nid = node_ids[k];
+        double w = node_ws[k];
+        Eigen::Matrix<double,6,1> se3 = x.segment<6>(offset + 6 * nid);
+        Sophus::SE3d T = Sophus::SE3d::exp(se3);
+        Eigen::Vector3d g = graph_[nid].position;
+        Eigen::Vector3d p = T.so3() * (v - g) + g + T.translation();
+        result += w * p;
+    }
+    return result;
+}
+
 void EDGraph::updateFromStateVector(const Eigen::VectorXd& x, int offset) {
     int G = numNodes();
     for (int i = 0; i < G; ++i) {
