@@ -92,8 +92,14 @@ void pickUpKeypoints(const std::vector<Eigen::Vector3d>& pc,
 
     std::default_random_engine rng;
     std::normal_distribution<double> dist(0.0, max_deform / 3);
-    key_new = key_old;
-    key_new[0].z() += std::abs(dist(rng));
+    key_new.resize(key_old.size());
+
+    for (size_t i = 0; i < key_old.size(); ++i) {
+        key_new[i] = key_old[i];
+        key_new[i].x() += dist(rng);
+        key_new[i].y() += dist(rng);
+        key_new[i].z() += dist(rng);
+    }
 }
 
 int main() {
@@ -136,13 +142,14 @@ int main() {
         node.transform = Sophus::SE3d();
         nodes.push_back(node);
     }
-    EDGraph edgraph(4);
+    EDGraph edgraph(6);
     edgraph.setGraphNodes(nodes);
     edgraph.bindVertices(model.getVertices());
 
     // 6. 优化控制节点位姿
     Optimizer optimizer;
     Eigen::VectorXd x0;
+    x0.resize(6 * edgraph.numNodes());  // ✅ 避免段错误
     edgraph.writeToStateVector(x0, 0);
     Eigen::VectorXd x_opt;
     optimizer.optimize(x0, x_opt, edgraph, key_old, key_new, key_indices);
