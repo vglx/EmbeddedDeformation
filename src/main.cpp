@@ -104,7 +104,7 @@ void pickUpKeypoints(const std::vector<Eigen::Vector3d>& pc,
 
 int main() {
     // 1. 加载 ASCII STL 模型
-    std::string stl_file = "model_ascii.stl";
+    std::string stl_file = "../model.stl";
     std::vector<Eigen::Vector3d> original_points;
     std::vector<MeshModel::Triangle> triangles;
     if (!loadSTL_ASCII(stl_file, original_points, triangles)) {
@@ -165,23 +165,38 @@ int main() {
     std::cout << "Loaded points: " << verts.size() << "  Deformed points: " << deformed.size() << std::endl;
 
     // 8. 保存变形前后点云为 PLY 文件
-       auto savePLY = [](const std::string& filename, const std::vector<Eigen::Vector3d>& points) {
-       std::ofstream ofs(filename);
-       if (!ofs.is_open()) {
-              std::cerr << "Failed to open file for writing: " << filename << std::endl;
-              return;
-       }
-       ofs << "ply\nformat ascii 1.0\nelement vertex " << points.size()
-              << "\nproperty float x\nproperty float y\nproperty float z\nend_header\n";
-       for (const auto& p : points) {
-              ofs << p.x() << " " << p.y() << " " << p.z() << "\n";
-       }
-       ofs.close();
-       std::cout << "Saved PLY: " << filename << std::endl;
-       };
+    auto savePLY = [](const std::string& filename, const std::vector<Eigen::Vector3d>& points) {
+    std::ofstream ofs(filename);
+    if (!ofs.is_open()) {
+            std::cerr << "Failed to open file for writing: " << filename << std::endl;
+            return;
+    }
+    ofs << "ply\nformat ascii 1.0\nelement vertex " << points.size()
+            << "\nproperty float x\nproperty float y\nproperty float z\nend_header\n";
+    for (const auto& p : points) {
+            ofs << p.x() << " " << p.y() << " " << p.z() << "\n";
+    }
+    ofs.close();
+    std::cout << "Saved PLY: " << filename << std::endl;
+    };
 
-       savePLY("original.ply", original_points);
-       savePLY("deformed.ply", deformed);
+    savePLY("original.ply", original_points);
+    savePLY("deformed.ply", deformed);
+
+    auto saveTXT = [](const std::string& filename, const std::vector<Eigen::Vector3d>& points) {
+        std::ofstream ofs(filename);
+        if (!ofs.is_open()) {
+            std::cerr << "Failed to open file: " << filename << std::endl;
+            return;
+        }
+        for (const auto& p : points) {
+            ofs << p.x() << " " << p.y() << " " << p.z() << "\n";
+        }
+        ofs.close();
+        std::cout << "Saved TXT: " << filename << std::endl;
+    };
+
+    saveTXT("deformed_cpp.txt", deformed);
 
 
     return 0;
