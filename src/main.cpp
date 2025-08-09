@@ -1,140 +1,186 @@
-// main.cpp (modified for grid sampling, Gaussian weights, and iterative embedding deformation)
+// main.cpp — patched version
+// - Safely initializes state vector x0 (6 * numNodes)
+// - Maps keypoints to vertex indices (key_indices) and passes them to Optimizer
+// - Minimal ASCII STL loader
+// - Writes deformed point cloud to deformed_cpp.txt
+
 #include <iostream>
-#include <vector>
-#include <random>
 #include <fstream>
 #include <sstream>
+#include <vector>
 #include <string>
+#include <random>
+#include <limits>
+#include <cmath>
+
 #include <Eigen/Dense>
+
 #include "MeshModel.h"
 #include "EDGraph.h"
 #include "Optimizer.h"
 
-// Load ASCII STL file into vertices and triangles
-bool loadSTL_ASCII(const std::string& filename,
-                   std::vector<Eigen::Vector3d>& vertices,
-                   std::vector<MeshModel::Triangle>& triangles) {
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "Failed to open STL file: " << filename << std::endl;
+// -----------------------------
+// Simple ASCII STL loader
+// -----------------------------
+// Loads vertices (unique-ified) and triangles from an ASCII STL file.
+// Note: ASCII STL lists each triangle's 3 vertices; we deduplicate by position.
+static bool loadSTL_ASCII(
+    const std::string& filename,
+    std::vector<Eigen::Vector3d>& out_vertices,
+    std::vector<MeshModel::Triangle>& out_tris)
+{
+    std::ifstream fin(filename);
+    if (!fin.is_open()) {
+        std::cerr << "Failed to open STL: " << filename << "\n";
         return false;
     }
+
+    // Map (x,y,z) -> index by string key (simple but sufficient)
+    std::vector<Eigen::Vector3d> raw;
+    raw.reserve(1 << 18);
+
     std::string line;
-    std::vector<Eigen::Vector3d> temp;
-    while (std::getline(file, line)) {
-        std::istringstream iss(line);
-        std::string prefix;
-        iss >> prefix;
-        if (prefix == "vertex") {
-            double x, y, z;
-            iss >> x >> y >> z;
-            temp.emplace_back(x, y, z);
+    std::vector<int> tri_indices;
+    tri_indices.reserve(1 << 18);
+
+    // We will deduplicate after reading
+    while (std::getline(fin, line)) {
+        // trim head
+        auto notspace = [](int ch){ return !std::isspace(ch); };
+        line.erase(line.begin(), std::find_if(line.begin(), line.end(), notspace));
+        if (line.rfind("vertex", 0) == 0) {
+            std::istringstream iss(line.substr(6));
+            double x, y, z; iss >> x >> y >> z;
+            raw.emplace_back(x, y, z);
         }
     }
-    file.close();
-    if (temp.size() % 3 != 0) {
-        std::cerr << "Invalid STL: vertex count not divisible by 3." << std::endl;
+
+    if (raw.empty() || raw.size() % 3 != 0) {
+        std::cerr << "STL appears empty or not multiple of 3 vertices (triangles)." << std::endl;
         return false;
     }
-    vertices = temp;
-    triangles.clear();
-    for (size_t i = 0; i < vertices.size(); i += 3) {
-        MeshModel::Triangle t;
-        t.v0 = static_cast<int>(i);
-        t.v1 = static_cast<int>(i + 1);
-        t.v2 = static_cast<int>(i + 2);
-        triangles.push_back(t);
+
+    // Deduplicate using a simple linear search with tolerance (could be optimized with hash)
+    const double eps2 = 1e-18; // exact compare by double is usually okay for ASCII STL; keep eps just in case
+    for (size_t i = 0; i < raw.size(); ++i) {
+        const Eigen::Vector3d& v = raw[i];
+        int found = -1;
+        for (size_t j = 0; j < out_vertices.size(); ++j) {
+            if ((out_vertices[j] - v).squaredNorm() <= eps2) { found = static_cast<int>(j); break; }
+        }
+        if (found < 0) {
+            out_vertices.push_back(v);
+            tri_indices.push_back(static_cast<int>(out_vertices.size() - 1));
+        } else {
+            tri_indices.push_back(found);
+        }
     }
+
+    // Build triangles
+    out_tris.clear();
+    out_tris.reserve(tri_indices.size() / 3);
+    for (size_t t = 0; t + 2 < tri_indices.size(); t += 3) {
+        MeshModel::Triangle tri;
+        tri.v0 = tri_indices[t + 0];
+        tri.v1 = tri_indices[t + 1];
+        tri.v2 = tri_indices[t + 2];
+        out_tris.push_back(tri);
+    }
+
     return true;
 }
 
-// Center point cloud at origin
-void centerPointCloud(std::vector<Eigen::Vector3d>& pts) {
-    Eigen::Vector3d c = Eigen::Vector3d::Zero();
-    for (auto& p : pts) c += p;
-    c /= pts.size();
-    for (auto& p : pts) p -= c;
-}
-
-void pickUpKeypoints(const std::vector<Eigen::Vector3d>& pc,
-                     double region_percent,
-                     double max_deform,
-                     std::vector<Eigen::Vector3d>& key_old,
-                     std::vector<Eigen::Vector3d>& key_new) {
-    Eigen::Vector3d min_pt = pc[0], max_pt = pc[0];
-    for (const auto& p : pc) {
-        min_pt = min_pt.cwiseMin(p);
-        max_pt = max_pt.cwiseMax(p);
-    }
-    Eigen::Vector3d delta = max_pt - min_pt;
-    Eigen::Vector3d region_min = min_pt + delta * ((1 - region_percent) / 2);
-    Eigen::Vector3d region_max = max_pt - delta * ((1 - region_percent) / 2);
-
-    key_old.resize(6);
-    key_new.resize(6);
-    for (int i = 0; i < 6; ++i) key_old[i] = pc[0];
-    for (const auto& p : pc) {
-        if ((p.array() >= region_min.array()).all() &&
-            (p.array() <= region_max.array()).all()) {
-            if (p.z() > key_old[0].z()) key_old[0] = p;
-            if (p.z() < key_old[1].z()) key_old[1] = p;
-            if (p.y() > key_old[2].y()) key_old[2] = p;
-            if (p.y() < key_old[3].y()) key_old[3] = p;
-            if (p.x() > key_old[4].x()) key_old[4] = p;
-            if (p.x() < key_old[5].x()) key_old[5] = p;
+// Map each key point (world position) to the nearest vertex index in verts
+static std::vector<int> mapToNearestIndex(
+    const std::vector<Eigen::Vector3d>& verts,
+    const std::vector<Eigen::Vector3d>& keys)
+{
+    std::vector<int> idx(keys.size(), -1);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        double best = std::numeric_limits<double>::infinity();
+        int best_id = -1;
+        for (size_t v = 0; v < verts.size(); ++v) {
+            double d = (verts[v] - keys[i]).squaredNorm();
+            if (d < best) { best = d; best_id = static_cast<int>(v); }
         }
+        idx[i] = best_id;
     }
-
-    key_new = key_old;
-    std::default_random_engine rng;
-    std::normal_distribution<double> dist(0.0, max_deform / 3);
-    key_new[0].z() += std::abs(dist(rng));
+    return idx;
 }
 
-int main() {
-    // 1. 加载 ASCII STL 模型
-    std::string stl_file = "model_ascii.stl";
-    std::vector<Eigen::Vector3d> original_points;
-    std::vector<MeshModel::Triangle> triangles;
-    if (!loadSTL_ASCII(stl_file, original_points, triangles)) {
-        return -1;
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        std::cout << "Usage: " << argv[0] << " <model_ascii.stl>\n";
+        return 0;
     }
 
-    // 2. 点云中心化
-    centerPointCloud(original_points);
+    const std::string stl_path = argv[1];
 
-    // 3. 构造 MeshModel
-    MeshModel model;
-    std::vector<MeshModel::Vertex> mesh_vs;
-    mesh_vs.reserve(original_points.size());
-    for (const auto& p : original_points) {
-        MeshModel::Vertex v; v.x = p.x(); v.y = p.y(); v.z = p.z();
-        v.nx = v.ny = v.nz = 0.0f;
-        mesh_vs.push_back(v);
+    // 1) Load STL (ASCII)
+    std::vector<Eigen::Vector3d> verts;               // unique positions
+    std::vector<MeshModel::Triangle> tris;            // triangle indices
+    if (!loadSTL_ASCII(stl_path, verts, tris)) return -1;
+    std::cout << "Loaded vertices: " << verts.size() << ", triangles: " << tris.size() << "\n";
+
+    // 2) Center the model at origin (optional but keeps parity with MATLAB scripts)
+    Eigen::Vector3d c = Eigen::Vector3d::Zero();
+    for (auto& v : verts) c += v;
+    if (!verts.empty()) c /= double(verts.size());
+    for (auto& v : verts) v -= c;
+
+    // 3) Fill MeshModel for EDGraph binding
+    std::vector<MeshModel::Vertex> mesh_verts;
+    mesh_verts.reserve(verts.size());
+    for (const auto& v : verts) {
+        MeshModel::Vertex mv; mv.x = float(v.x()); mv.y = float(v.y()); mv.z = float(v.z());
+        mv.nx = mv.ny = mv.nz = 0.f;
+        mesh_verts.push_back(mv);
     }
-    model.setVertices(mesh_vs);
-    model.setTriangles(triangles);
-    model.computeVertexNormals();
 
-    // 4. 采样关键点并扰动
+    MeshModel mesh;
+    mesh.setVertices(mesh_verts);
+    mesh.setTriangles(tris);
+
+    // 4) Build ED graph (voxel grid downsampling -> nodes) and bind vertices (K=6)
+    EDGraph edgraph(/*K_bind=*/6);
+    edgraph.initializeGraph(mesh.getVertices(), /*grid_size=*/20.0);
+    edgraph.buildKnnNeighbors(6); 
+
+    // 5) Prepare a small set of key constraints (demo): pick N random vertices and move them slightly
+    //    In your pipeline, you should load key_old/key_new from MATLAB txt to align exactly.
+    const int Nkeys = 6; // keep same as MATLAB pickUpPoints default (6)
+    std::mt19937 rng(0);
+    std::uniform_int_distribution<int> unif(0, int(verts.size()) - 1);
+
     std::vector<Eigen::Vector3d> key_old, key_new;
-    pickUpKeypoints(original_points, 0.4, 3.0, key_old, key_new);
+    key_old.reserve(Nkeys); key_new.reserve(Nkeys);
 
-    // 5. 构建 EDGraph 控制节点
-    int sampling_step = 50;
-    const auto& verts = model.getVertices();
-    EDGraph edgraph(6);  // K = 6
-    edgraph.initializeGraph(verts, 20);  // grid_size = 20
+    for (int i = 0; i < Nkeys; ++i) {
+        int vid = unif(rng);
+        Eigen::Vector3d vo = verts[vid];
+        key_old.push_back(vo);
+        // small positive z-perturbation (similar spirit to MATLAB pickUpPoints first key)
+        Eigen::Vector3d vn = vo; vn.z() += 3.0; // max_deform ~ 3 (example)
+        key_new.push_back(vn);
+    }
 
-    // 6. 优化控制节点位姿
-    Optimizer optimizer;
-    Eigen::VectorXd x0;
-    edgraph.writeToStateVector(x0, 0);
+    // 6) Map keys to nearest vertex indices (critical for using precomputed bindings/weights)
+    std::vector<int> key_indices = mapToNearestIndex(verts, key_old);
+
+    // 7) Initialize state x0 with correct size (6 * numNodes) and write initial transforms
+    const int G = edgraph.numNodes();
+    Eigen::VectorXd x0(6 * G);
+    edgraph.writeToStateVector(x0, /*offset=*/0);
+
+    // 8) Optimize node transforms so that ED(key_old) ≈ key_new
+    Optimizer opt;
     Eigen::VectorXd x_opt;
-    optimizer.optimize(x0, x_opt, edgraph, key_old, key_new);
-    edgraph.updateFromStateVector(x_opt, 0);
+    opt.optimize(x0, x_opt, edgraph, key_old, key_new, key_indices);
 
-    // 7. 应用形变并输出
+    // 9) Update graph with optimized state
+    edgraph.updateFromStateVector(x_opt, /*offset=*/0);
+
+    // 10) Apply deformation to all vertices and dump to txt (for RMSE check against MATLAB)
     std::vector<Eigen::Vector3d> deformed;
     deformed.reserve(verts.size());
     for (size_t i = 0; i < verts.size(); ++i) {

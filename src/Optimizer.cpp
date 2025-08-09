@@ -1,75 +1,157 @@
 #include "Optimizer.h"
 #include <iostream>
-#include <Eigen/Sparse>
+#include <limits>
+
+namespace {
+inline double cost_from_r(const Eigen::VectorXd& r) {
+    return 0.5 * r.squaredNorm();
+}
+}
 
 void Optimizer::optimize(const Eigen::VectorXd& x0,
                          Eigen::VectorXd& x_opt,
                          EDGraph& edgraph,
                          const std::vector<Eigen::Vector3d>& key_old,
                          const std::vector<Eigen::Vector3d>& key_new,
-                         const std::vector<int>& key_indices) {
-    const double epsilon = 1e-6;
-    const int max_iter = 20;
-    double lambda = 1e-4;
+                         const std::vector<int>& key_indices)
+{
+    // --- Settings ---
+    const int    G       = edgraph.numNodes();
+    const int    DoF     = 6 * G;
+    const int    max_it  = 30;
+    const double tol_dx  = 1e-6;
+    const double tol_dF  = 1e-9;
+
+    // Residual weights (align roughly with MATLAB script: data > smooth)
+    const double w_data   = 10.0;   // sqrt(100)
+    const double w_smooth = 3.1622776601683795; // sqrt(10)
 
     x_opt = x0;
-    int num_vars = static_cast<int>(x0.size());
-    int num_residuals = static_cast<int>(key_old.size()) * 3;
 
-    for (int iter = 0; iter < max_iter; ++iter) {
-        // Build residual vector and Jacobian
-        Eigen::VectorXd residual(num_residuals);
-        Eigen::SparseMatrix<double> J(num_residuals, num_vars);
-        std::vector<Eigen::Triplet<double>> triplets;
+    // Accessors
+    const auto& Nodes    = edgraph.getGraphNodes();
+    const auto& Bindings = edgraph.getBindings();
+    const auto& Weights  = edgraph.getWeights();
 
-        for (size_t i = 0; i < key_old.size(); ++i) {
-            // Compute deformed keypoint
-            Eigen::Vector3d def = edgraph.deformVertexByState(key_old[i], x_opt, key_indices[i]);
-            // Residual: difference to target
-            Eigen::Vector3d r = def - key_new[i];
-            residual.segment<3>(3 * i) = r;
-            // Numerical Jacobian
-            for (int j = 0; j < num_vars; ++j) {
-                Eigen::VectorXd x_eps = x_opt;
-                double delta = std::max(1e-8, std::abs(x_opt[j]) * 1e-4);
-                x_eps[j] += delta;
-                Eigen::Vector3d def_eps = edgraph.deformVertexByState(key_old[i], x_eps, key_indices[i]);
-                Eigen::Vector3d diff = (def_eps - def) / delta;
-                triplets.emplace_back(3 * i + 0, j, diff[0]);
-                triplets.emplace_back(3 * i + 1, j, diff[1]);
-                triplets.emplace_back(3 * i + 2, j, diff[2]);
+    // Build residual evaluation (smooth + data)
+    auto eval_residual = [&](const Eigen::VectorXd& x, Eigen::VectorXd& r) {
+        // Count directed smooth edges
+        size_t E = 0;
+        for (int i = 0; i < G; ++i) E += Nodes[i].neighbors.size();
+        const int m = static_cast<int>(3*E + 3*key_old.size());
+        r.setZero(m);
+
+        int cursor = 0;
+
+        // Smoothness residuals: r_ij = Ri(gj-gi) + gi + ti - (gj + tj)
+        for (int i = 0; i < G; ++i) {
+            Eigen::Matrix<double,6,1> xi = x.segment<6>(6*i);
+            Sophus::SE3d Ti = Sophus::SE3d::exp(xi);
+            const Eigen::Vector3d& gi = Nodes[i].position;
+            for (int j : Nodes[i].neighbors) {
+                Eigen::Matrix<double,6,1> xj = x.segment<6>(6*j);
+                Sophus::SE3d Tj = Sophus::SE3d::exp(xj);
+                const Eigen::Vector3d& gj = Nodes[j].position;
+
+                Eigen::Vector3d pred_i = Ti.so3() * (gj - gi) + gi + Ti.translation();
+                Eigen::Vector3d pred_j = gj + Tj.translation();
+                r.segment<3>(cursor) = w_smooth * (pred_i - pred_j);
+                cursor += 3;
             }
         }
-        J.setFromTriplets(triplets.begin(), triplets.end());
 
-        // Form approximated Hessian H = J^T J + λ I
-        Eigen::SparseMatrix<double> H = J.transpose() * J;
-        for (int k = 0; k < H.outerSize(); ++k)
-            for (Eigen::SparseMatrix<double>::InnerIterator it(H, k); it; ++it)
-                if (it.row() == it.col())
-                    it.valueRef() += lambda;
+        // Data residuals: r_k = ED(v_k) - v'_k, using per-vertex bindings/weights
+        for (size_t k = 0; k < key_old.size(); ++k) {
+            const int vid = key_indices[k];
+            const auto& ids = Bindings[vid];
+            std::vector<double> ws = Weights[vid];
+            double s = 0.0; for (double w : ws) s += w; if (s > 0) for (double& w : ws) w /= s;
 
-        // Gradient g = -J^T r
-        Eigen::VectorXd g = -J.transpose() * residual;
-        Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
-        solver.compute(H);
-        if (solver.info() != Eigen::Success) {
-            std::cerr << "Decomposition failed" << std::endl;
+            Eigen::Vector3d pred = edgraph.deformVertexByState(key_old[k], x, ids, ws, /*offset=*/0);
+            r.segment<3>(cursor) = w_data * (pred - key_new[k]);
+            cursor += 3;
+        }
+    };
+
+    // Finite-difference Jacobian (robust but slower). You can swap to analytic later.
+    auto eval_numeric_J = [&](const Eigen::VectorXd& x, const Eigen::VectorXd& r0, Eigen::MatrixXd& J) {
+        const double eps = 1e-6;
+        const int m = static_cast<int>(r0.size());
+        J.setZero(m, DoF);
+        Eigen::VectorXd r1(m);
+        for (int c = 0; c < DoF; ++c) {
+            Eigen::VectorXd x_pert = x;
+            x_pert[c] += eps;
+            eval_residual(x_pert, r1);
+            J.col(c) = (r1 - r0) / eps;
+        }
+    };
+
+    // Levenberg–Marquardt style damping
+    double lambda = 1e-4;
+
+    // Initial residual & cost
+    Eigen::VectorXd r;
+    eval_residual(x_opt, r);
+    double cost = cost_from_r(r);
+
+    for (int it = 0; it < max_it; ++it) {
+        // Jacobian at current x
+        Eigen::MatrixXd J;
+        eval_numeric_J(x_opt, r, J);
+
+        // Normal equations with damping
+        Eigen::MatrixXd H = J.transpose() * J;
+        Eigen::VectorXd g = -J.transpose() * r;
+        H += lambda * Eigen::MatrixXd::Identity(DoF, DoF);
+
+        // Solve H dx = g
+        Eigen::VectorXd dx = H.ldlt().solve(g);
+        if (!dx.allFinite()) {
+            std::cerr << "[Optimizer] Non-finite dx, abort.\n";
             break;
         }
-        Eigen::VectorXd dx = solver.solve(g);
-        if (solver.info() != Eigen::Success) {
-            std::cerr << "Solving failed" << std::endl;
+
+        if (dx.norm() < tol_dx) {
+            std::cout << "[Optimizer] Converged by dx at iter " << it << "\n";
             break;
         }
 
-        // Check convergence
-        if (dx.norm() < epsilon) {
-            std::cout << "Converged at iteration " << iter << std::endl;
-            break;
-        }
+        // Tentative update
+        Eigen::VectorXd x_new = x_opt + dx;
+        Eigen::VectorXd r_new;
+        eval_residual(x_new, r_new);
+        double cost_new = cost_from_r(r_new);
 
-        // Update state
-        x_opt += dx;
+        // Accept / reject step with simple LM schedule
+        if (cost_new < cost - tol_dF) {
+            // Good step: accept and decrease lambda
+            x_opt = x_new;
+            r = r_new;
+            cost = cost_new;
+            lambda = std::max(1e-8, lambda * 0.5);
+            std::cout << "[Optimizer] it=" << it << ", cost=" << cost << ", lambda=" << lambda << " (accepted)\n";
+        } else {
+            // Bad step: increase lambda and retry (up to a few times)
+            bool accepted = false;
+            for (int rep = 0; rep < 5; ++rep) {
+                lambda *= 4.0;
+                H = J.transpose() * J + lambda * Eigen::MatrixXd::Identity(DoF, DoF);
+                dx = H.ldlt().solve(g);
+                if (!dx.allFinite() || dx.norm() < 1e-15) break;
+                x_new = x_opt + dx;
+                eval_residual(x_new, r_new);
+                cost_new = cost_from_r(r_new);
+                if (cost_new < cost - tol_dF) {
+                    x_opt = x_new; r = r_new; cost = cost_new; accepted = true; break;
+                }
+            }
+            std::cout << "[Optimizer] it=" << it << ", cost_try=" << cost_new << ", lambda=" << lambda
+                      << (accepted ? " (accepted after damping)\n" : " (rejected)\n");
+            if (!accepted) {
+                // If we consistently fail to improve, stop.
+                break;
+            }
+        }
     }
 }
