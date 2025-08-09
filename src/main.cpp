@@ -35,7 +35,6 @@ static bool loadSTL_ASCII(
         return false;
     }
 
-    // Map (x,y,z) -> index by string key (simple but sufficient)
     std::vector<Eigen::Vector3d> raw;
     raw.reserve(1 << 18);
 
@@ -43,9 +42,7 @@ static bool loadSTL_ASCII(
     std::vector<int> tri_indices;
     tri_indices.reserve(1 << 18);
 
-    // We will deduplicate after reading
     while (std::getline(fin, line)) {
-        // trim head
         auto notspace = [](int ch){ return !std::isspace(ch); };
         line.erase(line.begin(), std::find_if(line.begin(), line.end(), notspace));
         if (line.rfind("vertex", 0) == 0) {
@@ -60,23 +57,18 @@ static bool loadSTL_ASCII(
         return false;
     }
 
-    // Deduplicate using a simple linear search with tolerance (could be optimized with hash)
-    const double eps2 = 1e-18; // exact compare by double is usually okay for ASCII STL; keep eps just in case
+    // ✅ 不再去重：按 STL 出现顺序原样写入
+    out_vertices.clear();
+    out_vertices.reserve(raw.size());
+    tri_indices.clear();
+    tri_indices.reserve(raw.size());
+
     for (size_t i = 0; i < raw.size(); ++i) {
-        const Eigen::Vector3d& v = raw[i];
-        int found = -1;
-        for (size_t j = 0; j < out_vertices.size(); ++j) {
-            if ((out_vertices[j] - v).squaredNorm() <= eps2) { found = static_cast<int>(j); break; }
-        }
-        if (found < 0) {
-            out_vertices.push_back(v);
-            tri_indices.push_back(static_cast<int>(out_vertices.size() - 1));
-        } else {
-            tri_indices.push_back(found);
-        }
+        out_vertices.push_back(raw[i]);
+        tri_indices.push_back(static_cast<int>(out_vertices.size() - 1));
     }
 
-    // Build triangles
+    // Build triangles (每 3 个顶点组成一个三角形)
     out_tris.clear();
     out_tris.reserve(tri_indices.size() / 3);
     for (size_t t = 0; t + 2 < tri_indices.size(); t += 3) {
