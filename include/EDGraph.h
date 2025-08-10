@@ -21,11 +21,21 @@ public:
 
     void setGraphNodes(const std::vector<DeformationNode>& nodes);
 
-    // Bind each vertex to K nearest nodes (weights now use (K+1)-th distance as base)
+    // Bind each vertex to K nearest nodes (weights use (K+1)-th distance as base; then keep first K)
     void bindVertices(const std::vector<MeshModel::Vertex>& vertices);
 
     // Deform a single vertex (by its precomputed binding of vidx)
     Eigen::Vector3d deformVertex(const MeshModel::Vertex& vertex, int vidx) const;
+    // Overload for convenience when you have Eigen::Vector3d instead of MeshModel::Vertex
+    Eigen::Vector3d deformVertex(const Eigen::Vector3d& v, int vidx) const;
+
+    // Evaluate deformation under an EXTERNAL state vector x (does NOT modify internal graph state)
+    // ids/ws are the precomputed binding for the vertex to be deformed.
+    Eigen::Vector3d deformVertexByState(const Eigen::Vector3d& v,
+                                        const Eigen::VectorXd& x,
+                                        const std::vector<int>& ids,
+                                        const std::vector<double>& ws,
+                                        int offset) const;
 
     // State I/O (6 DoF per node); write will auto-resize target vector
     void updateFromStateVector(const Eigen::VectorXd& x, int offset);

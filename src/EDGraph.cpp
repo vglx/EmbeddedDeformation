@@ -78,10 +78,49 @@ Eigen::Vector3d EDGraph::deformVertex(const MeshModel::Vertex& vertex, int vidx)
 
     const auto& ids = bindings_[vidx];
     const auto& ws  = weights_[vidx];
+    double sw = 0.0; for (double w : ws) sw += w; const double inv_sw = (sw>1e-12)?1.0/sw:1.0;
     for (size_t k = 0; k < ids.size(); ++k) {
         const auto& node = graph_[ids[k]];
         const Eigen::Vector3d& g = node.position;
-        out += ws[k] * (node.transform.so3() * (v - g) + g + node.transform.translation());
+        out += (ws[k]*inv_sw) * (node.transform.so3() * (v - g) + g + node.transform.translation());
+    }
+    return out;
+}
+
+Eigen::Vector3d EDGraph::deformVertex(const Eigen::Vector3d& v, int vidx) const {
+    Eigen::Vector3d out = Eigen::Vector3d::Zero();
+    const auto& ids = bindings_[vidx];
+    const auto& ws  = weights_[vidx];
+    double sw = 0.0; for (double w : ws) sw += w; const double inv_sw = (sw>1e-12)?1.0/sw:1.0;
+    for (size_t k = 0; k < ids.size(); ++k) {
+        const auto& node = graph_[ids[k]];
+        const Eigen::Vector3d& g = node.position;
+        out += (ws[k]*inv_sw) * (node.transform.so3() * (v - g) + g + node.transform.translation());
+    }
+    return out;
+}
+
+Eigen::Vector3d EDGraph::deformVertexByState(const Eigen::Vector3d& v,
+                                             const Eigen::VectorXd& x,
+                                             const std::vector<int>& ids,
+                                             const std::vector<double>& ws,
+                                             int offset) const
+{
+    Eigen::Vector3d out = Eigen::Vector3d::Zero();
+
+    // Defensive normalization
+    double sw = 0.0; for (double w : ws) sw += w; const double inv_sw = (sw>1e-12)?1.0/sw:1.0;
+
+    for (size_t k = 0; k < ids.size(); ++k) {
+        const int nid = ids[k];
+        const double wk = ws[k] * inv_sw;
+
+        // Read node state from x
+        Eigen::Matrix<double,6,1> se3 = x.segment<6>(offset + 6 * nid);
+        Sophus::SE3d T = Sophus::SE3d::exp(se3);
+
+        const Eigen::Vector3d& g = graph_[nid].position;
+        out += wk * (T.so3() * (v - g) + g + T.translation());
     }
     return out;
 }
