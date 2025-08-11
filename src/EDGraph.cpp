@@ -4,23 +4,59 @@
 
 EDGraph::EDGraph(int K): K_(K) {}
 
-void EDGraph::initializeGraph(const std::vector<MeshModel::Vertex>& vertices, int sampling_step) {
+void EDGraph::initializeGraph(const std::vector<MeshModel::Vertex>& vertices, double grid_size) {
+    // 1) Voxel downsample to build nodes (match MATLAB grid_size behavior)
     std::vector<DeformationNode> nodes;
-    nodes.reserve(vertices.size() / std::max(1, sampling_step) + 1);
-
-    for (size_t i = 0; i < vertices.size(); i += std::max(1, sampling_step)) {
-        const auto& v = vertices[i];
-        DeformationNode node;
-        node.position  = Eigen::Vector3d(v.x, v.y, v.z);
-        node.transform = Sophus::SE3d();  // identity
-        nodes.push_back(node);
-    }
+    voxelDownsample(vertices, grid_size, nodes);
     setGraphNodes(nodes);
+
+    // 2) Bind vertices to nodes (K+1 base weighting)
     bindVertices(vertices);
 }
 
 void EDGraph::setGraphNodes(const std::vector<DeformationNode>& nodes) {
     graph_ = nodes;
+}
+
+void EDGraph::voxelDownsample(const std::vector<MeshModel::Vertex>& vertices,
+                              double grid_size,
+                              std::vector<DeformationNode>& out_nodes) const
+{
+    out_nodes.clear();
+    if (vertices.empty()) return;
+    const double gs = (grid_size > 1e-12) ? grid_size : 1.0;
+
+    struct Accum { Eigen::Vector3d sum; int cnt; };
+    std::unordered_map<VoxelKey, Accum, VoxelKeyHash, VoxelKeyEq> buckets;
+    buckets.reserve(vertices.size()/8 + 1);
+
+    auto toKey = [gs](const Eigen::Vector3d& p){
+        // floor division into voxel indices; handle negatives consistently
+        int ix = static_cast<int>(std::floor(p.x() / gs));
+        int iy = static_cast<int>(std::floor(p.y() / gs));
+        int iz = static_cast<int>(std::floor(p.z() / gs));
+        return VoxelKey{ix,iy,iz};
+    };
+
+    // accumulate
+    for (const auto& v : vertices) {
+        Eigen::Vector3d p(v.x, v.y, v.z);
+        VoxelKey key = toKey(p);
+        auto it = buckets.find(key);
+        if (it == buckets.end()) {
+            buckets.emplace(key, Accum{p, 1});
+        } else {
+            it->second.sum += p; it->second.cnt += 1;
+        }
+    }
+
+    out_nodes.reserve(buckets.size());
+    for (const auto& kv : buckets) {
+        DeformationNode node;
+        node.position  = kv.second.sum / std::max(1, kv.second.cnt);
+        node.transform = Sophus::SE3d(); // identity
+        out_nodes.push_back(node);
+    }
 }
 
 void EDGraph::bindVertices(const std::vector<MeshModel::Vertex>& vertices) {
@@ -123,6 +159,26 @@ Eigen::Vector3d EDGraph::deformVertexByState(const Eigen::Vector3d& v,
         out += wk * (T.so3() * (v - g) + g + T.translation());
     }
     return out;
+}
+
+void EDGraph::buildKnnNeighbors(int Ksmooth) {
+    const int G = numNodes();
+    node_neighbors_.assign(G, {});
+    if (G <= 1) return;
+
+    for (int i = 0; i < G; ++i) {
+        std::vector<std::pair<int,double>> d; d.reserve(G-1);
+        const Eigen::Vector3d gi = graph_[i].position;
+        for (int j = 0; j < G; ++j) if (j != i) {
+            double dist = (gi - graph_[j].position).norm();
+            d.emplace_back(j, dist);
+        }
+        const int need = std::min(Ksmooth, (int)d.size());
+        std::nth_element(d.begin(), d.begin()+need, d.end(),
+                         [](const auto& a, const auto& b){ return a.second < b.second; });
+        node_neighbors_[i].resize(need);
+        for (int k = 0; k < need; ++k) node_neighbors_[i][k] = d[k].first;
+    }
 }
 
 void EDGraph::updateFromStateVector(const Eigen::VectorXd& x, int offset) {

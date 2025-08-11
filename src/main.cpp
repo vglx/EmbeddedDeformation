@@ -6,6 +6,7 @@
 #include <limits>
 #include <random>
 #include <algorithm>
+#include <numeric>
 
 #include <Eigen/Dense>
 
@@ -89,7 +90,6 @@ static void centerPointCloud(std::vector<Eigen::Vector3d>& P) {
 }
 
 // -------- Geometry comparison utilities (order-invariant) --------
-// Convert vector<Eigen::Vector3d> to Eigen::MatrixXd (N x 3)
 static Eigen::MatrixXd toMat(const std::vector<Eigen::Vector3d>& pts) {
     Eigen::MatrixXd M(pts.size(), 3);
     for (size_t i = 0; i < pts.size(); ++i) M.row((int)i) = pts[i].transpose();
@@ -99,25 +99,20 @@ static Eigen::MatrixXd toMat(const std::vector<Eigen::Vector3d>& pts) {
 // Kabsch (Procrustes without scaling/reflection): find R,t aligning B->A
 static void kabschAlign(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B,
                         Eigen::Matrix3d& R, Eigen::Vector3d& t) {
-    // centroids
     Eigen::Vector3d ca = A.colwise().mean();
     Eigen::Vector3d cb = B.colwise().mean();
     Eigen::MatrixXd Ac = A.rowwise() - ca.transpose();
     Eigen::MatrixXd Bc = B.rowwise() - cb.transpose();
-    // covariance
     Eigen::Matrix3d H = Bc.transpose() * Ac;
     Eigen::JacobiSVD<Eigen::Matrix3d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
     Eigen::Matrix3d U = svd.matrixU();
     Eigen::Matrix3d V = svd.matrixV();
     R = V * U.transpose();
-    if (R.determinant() < 0) { // avoid reflection
-        V.col(2) *= -1;
-        R = V * U.transpose();
-    }
+    if (R.determinant() < 0) { V.col(2) *= -1; R = V * U.transpose(); }
     t = ca - R * cb;
 }
 
-// Brute-force NN distances from P to Q (each P finds nearest in Q). O(N*M) — ok for moderate sizes
+// Brute-force NN distances from P to Q (each P finds nearest in Q). O(N*M)
 static Eigen::VectorXd nnDists(const Eigen::MatrixXd& P, const Eigen::MatrixXd& Q) {
     const int N = (int)P.rows();
     const int M = (int)Q.rows();
@@ -133,7 +128,6 @@ static Eigen::VectorXd nnDists(const Eigen::MatrixXd& P, const Eigen::MatrixXd& 
     return d;
 }
 
-// Optional random subsampling to accelerate comparisons
 static Eigen::MatrixXd subsampleRows(const Eigen::MatrixXd& X, int maxN) {
     if ((int)X.rows() <= maxN) return X;
     std::vector<int> idx(X.rows());
@@ -160,52 +154,56 @@ int main(int argc, char** argv) {
     MeshModel model;
     std::vector<MeshModel::Vertex> mesh_vs; mesh_vs.reserve(original_points.size());
     for (const auto& p : original_points) {
-        MeshModel::Vertex v; v.x = (float)p.x(); v.y = (float)p.y(); v.z = (float)p.z();
-        v.nx = v.ny = v.nz = 0.0f; mesh_vs.push_back(v);
+        MeshModel::Vertex v; v.x = p.x(); v.y = p.y(); v.z = p.z();
+        v.nx = v.ny = v.nz = 0.0; mesh_vs.push_back(v);
     }
     model.setVertices(mesh_vs);
     model.setTriangles(triangles);
 
-    // 4) Build ED graph and bind vertices
+    // 4) Build ED graph via voxel downsampling (grid_size = 20) and bind vertices
     EDGraph edgraph(/*K_bind=*/6);
-    edgraph.initializeGraph(model.getVertices(), /*sampling_step=*/20 /* ≈ grid_size proxy */);
+    edgraph.initializeGraph(model.getVertices(), /*grid_size=*/20.0);
+    edgraph.buildKnnNeighbors(/*Ksmooth=*/5); // match MATLAB: num_nearestpts-1
 
     // 5) Load MATLAB keypoints and map to nearest vertex indices
-    std::vector<Eigen::Vector3d> key_old = loadXYZ("../key_old.txt");
-    std::vector<Eigen::Vector3d> key_new = loadXYZ("../key_new.txt");
+    std::vector<Eigen::Vector3d> key_old = loadXYZ("key_old.txt");
+    std::vector<Eigen::Vector3d> key_new = loadXYZ("key_new.txt");
     if (key_old.empty() || key_new.empty() || key_old.size() != key_new.size()) {
         std::cerr << "Keypoints invalid: key_old/new missing or size mismatch" << std::endl;
         return -1;
     }
     std::vector<int> key_indices = mapToNearestIndex(original_points, key_old);
 
-    // 6) Initialize state and optimize
+    // 6) Initialize state and optimize (data + smooth)
     const int G = edgraph.numNodes();
     Eigen::VectorXd x0(6 * G);
     edgraph.writeToStateVector(x0, 0);
 
     Optimizer optimizer;
+    Optimizer::Options opts; // tweak here if needed
+    opts.max_iters = 50;
+    opts.w_data    = 12.0;  // stronger data
+    opts.w_smooth  = 1.0;   // gentle smoothness
     Eigen::VectorXd x_opt;
-    optimizer.optimize(x0, x_opt, edgraph, key_old, key_new, key_indices);
+    optimizer.optimize(x0, x_opt, edgraph, key_old, key_new, key_indices, opts);
     edgraph.updateFromStateVector(x_opt, 0);
 
     // 7) Deform all vertices and dump
     std::vector<Eigen::Vector3d> deformed; deformed.reserve(mesh_vs.size());
     for (size_t i = 0; i < mesh_vs.size(); ++i) {
         const auto& mv = mesh_vs[i];
-        Eigen::Vector3d v(mv.x, mv.y, mv.z);
-        deformed.push_back(edgraph.deformVertex(v, (int)i));
+        deformed.push_back(edgraph.deformVertex(mv, (int)i));
     }
 
     // Save for MATLAB comparison
     {
-        std::ofstream fout("../deformed_cpp.txt");
+        std::ofstream fout("deformed_cpp.txt");
         for (const auto& p : deformed) fout << p.x() << ' ' << p.y() << ' ' << p.z() << '\n';
         std::cout << "Saved deformed_cpp.txt (" << deformed.size() << " points)\n";
     }
 
     // 8) If MATLAB output exists, do in-program geometric comparison
-    std::ifstream test("../deformed_matlab.txt");
+    std::ifstream test("deformed_matlab.txt");
     if (test.good()) {
         std::cout << "\n[Compare] Found deformed_matlab.txt — running alignment & metrics...\n";
         std::vector<Eigen::Vector3d> matlab_pts = loadXYZ("deformed_matlab.txt");
@@ -216,28 +214,20 @@ int main(int argc, char** argv) {
         Eigen::MatrixXd A = toMat(matlab_pts);
         Eigen::MatrixXd B = toMat(deformed);
 
-        // Optional subsampling for speed (tune maxN as needed)
-        const int maxN = 120000;
+        const int maxN = 120000; // adjust if needed
         A = subsampleRows(A, maxN);
         B = subsampleRows(B, maxN);
 
-        // Kabsch alignment (B -> A)
         Eigen::Matrix3d R; Eigen::Vector3d t;
         kabschAlign(A, B, R, t);
         Eigen::MatrixXd B_aligned = (B * R.transpose()).rowwise() + t.transpose();
 
-        // NN-based RMSE after alignment (using NN pairs)
-        // build NN pairs: for each A find nearest in B_aligned
         Eigen::VectorXd dA = nnDists(A, B_aligned);
-        // for RMSE of pairs, use the same distances
-        double rmse = std::sqrt(dA.array().square().mean());
-
-        // Symmetric Chamfer: mean(A->B) + mean(B->A)
         Eigen::VectorXd dB = nnDists(B_aligned, A);
-        double chamfer = dA.mean() + dB.mean();
 
-        // Hausdorff: worst nearest distance among both directions
-        double haus = std::max(dA.maxCoeff(), dB.maxCoeff());
+        double rmse    = std::sqrt(dA.array().square().mean());
+        double chamfer = dA.mean() + dB.mean();
+        double haus    = std::max(dA.maxCoeff(), dB.maxCoeff());
 
         std::cout << "RMSE (NN-correspondence, after alignment): " << rmse << "\n";
         std::cout << "Chamfer distance (symmetric mean NN): " << chamfer
