@@ -1,16 +1,31 @@
 #include "EDGraph.h"
 #include <algorithm>
-#include <cmath>
+#include <limits>
 
-EDGraph::EDGraph(int K): K_(K) {}
+// ---- Voxel hash key for downsampling ----
+struct VoxelKey { int x, y, z; };
+struct VoxelKeyHash {
+    std::size_t operator()(const VoxelKey& k) const noexcept {
+        // simple mix
+        std::size_t h = 1469598103934665603ull;
+        h ^= std::hash<int>{}(k.x) + 0x9e3779b97f4a7c15ull + (h<<6) + (h>>2);
+        h ^= std::hash<int>{}(k.y) + 0x9e3779b97f4a7c15ull + (h<<6) + (h>>2);
+        h ^= std::hash<int>{}(k.z) + 0x9e3779b97f4a7c15ull + (h<<6) + (h>>2);
+        return h;
+    }
+};
+struct VoxelKeyEq {
+    bool operator()(const VoxelKey& a, const VoxelKey& b) const noexcept {
+        return a.x==b.x && a.y==b.y && a.z==b.z;
+    }
+};
+
+EDGraph::EDGraph(int K) : K_(K) {}
 
 void EDGraph::initializeGraph(const std::vector<MeshModel::Vertex>& vertices, double grid_size) {
-    // 1) Voxel downsample to build nodes (match MATLAB grid_size behavior)
     std::vector<DeformationNode> nodes;
     voxelDownsample(vertices, grid_size, nodes);
     setGraphNodes(nodes);
-
-    // 2) Bind vertices to nodes (K+1 base weighting)
     bindVertices(vertices);
 }
 
@@ -31,14 +46,12 @@ void EDGraph::voxelDownsample(const std::vector<MeshModel::Vertex>& vertices,
     buckets.reserve(vertices.size()/8 + 1);
 
     auto toKey = [gs](const Eigen::Vector3d& p){
-        // floor division into voxel indices; handle negatives consistently
         int ix = static_cast<int>(std::floor(p.x() / gs));
         int iy = static_cast<int>(std::floor(p.y() / gs));
         int iz = static_cast<int>(std::floor(p.z() / gs));
         return VoxelKey{ix,iy,iz};
     };
 
-    // accumulate
     for (const auto& v : vertices) {
         Eigen::Vector3d p(v.x, v.y, v.z);
         VoxelKey key = toKey(p);
@@ -53,8 +66,9 @@ void EDGraph::voxelDownsample(const std::vector<MeshModel::Vertex>& vertices,
     out_nodes.reserve(buckets.size());
     for (const auto& kv : buckets) {
         DeformationNode node;
-        node.position  = kv.second.sum / std::max(1, kv.second.cnt);
-        node.transform = Sophus::SE3d(); // identity
+        node.position = kv.second.sum / std::max(1, kv.second.cnt);
+        node.A.setIdentity();
+        node.t.setZero();
         out_nodes.push_back(node);
     }
 }
@@ -69,31 +83,23 @@ void EDGraph::bindVertices(const std::vector<MeshModel::Vertex>& vertices) {
     for (size_t i = 0; i < nV; ++i) {
         const Eigen::Vector3d v(vertices[i].x, vertices[i].y, vertices[i].z);
 
-        // 收集到所有节点的距离
-        std::vector<std::pair<int,double>> dists;
-        dists.reserve(G);
+        // compute distances to all nodes
+        std::vector<std::pair<int,double>> dists; dists.reserve(G);
         for (int j = 0; j < G; ++j) {
             double dist = (v - graph_[j].position).norm();
             dists.emplace_back(j, dist);
         }
 
-        // 计算 base：第 K+1 小的距离（0-based 第 K_ 位）
-        const int base_rank = std::min(K_, G - 1);  // 防越界
-        std::nth_element(
-            dists.begin(), dists.begin() + base_rank, dists.end(),
-            [](const auto& a, const auto& b){ return a.second < b.second; }
-        );
+        const int base_rank = std::min(K_, G - 1);
+        std::nth_element(dists.begin(), dists.begin() + base_rank, dists.end(),
+                         [](const auto& a, const auto& b){ return a.second < b.second; });
         double base = dists[base_rank].second;
-        if (base < 1e-12) base = 1e-12; // 防除零
+        if (base < 1e-12) base = 1e-12;
 
-        // 确保前 K_ 个是真正最近的 K 个（提升稳定性）
         const int kth = std::min(K_, static_cast<int>(dists.size()));
-        std::partial_sort(
-            dists.begin(), dists.begin() + kth, dists.end(),
-            [](const auto& a, const auto& b){ return a.second < b.second; }
-        );
+        std::partial_sort(dists.begin(), dists.begin()+kth, dists.end(),
+                          [](const auto& a, const auto& b){ return a.second < b.second; });
 
-        // 计算权重：w_k = max(0, 1 - d_k / base)，然后归一化
         bindings_[i].resize(kth);
         weights_[i].resize(kth);
         double sumw = 0.0;
@@ -105,7 +111,6 @@ void EDGraph::bindVertices(const std::vector<MeshModel::Vertex>& vertices) {
             sumw += w;
         }
         if (sumw < 1e-12) {
-            // 退化情况：均匀分布
             const double uni = 1.0 / std::max(1, kth);
             for (double& w : weights_[i]) w = uni;
         } else {
@@ -116,28 +121,19 @@ void EDGraph::bindVertices(const std::vector<MeshModel::Vertex>& vertices) {
 
 Eigen::Vector3d EDGraph::deformVertex(const MeshModel::Vertex& vertex, int vidx) const {
     const Eigen::Vector3d v(vertex.x, vertex.y, vertex.z);
-    Eigen::Vector3d out = Eigen::Vector3d::Zero();
-
-    const auto& ids = bindings_[vidx];
-    const auto& ws  = weights_[vidx];
-    double sw = 0.0; for (double w : ws) sw += w; const double inv_sw = (sw>1e-12)?1.0/sw:1.0;
-    for (size_t k = 0; k < ids.size(); ++k) {
-        const auto& node = graph_[ids[k]];
-        const Eigen::Vector3d& g = node.position;
-        out += (ws[k]*inv_sw) * (node.transform.so3() * (v - g) + g + node.transform.translation());
-    }
-    return out;
+    return deformVertex(v, vidx);
 }
 
 Eigen::Vector3d EDGraph::deformVertex(const Eigen::Vector3d& v, int vidx) const {
     Eigen::Vector3d out = Eigen::Vector3d::Zero();
+
     const auto& ids = bindings_[vidx];
     const auto& ws  = weights_[vidx];
     double sw = 0.0; for (double w : ws) sw += w; const double inv_sw = (sw>1e-12)?1.0/sw:1.0;
     for (size_t k = 0; k < ids.size(); ++k) {
         const auto& node = graph_[ids[k]];
         const Eigen::Vector3d& g = node.position;
-        out += (ws[k]*inv_sw) * (node.transform.so3() * (v - g) + g + node.transform.translation());
+        out += (ws[k]*inv_sw) * (node.A * (v - g) + g + node.t);
     }
     return out;
 }
@@ -150,19 +146,22 @@ Eigen::Vector3d EDGraph::deformVertexByState(const Eigen::Vector3d& v,
 {
     Eigen::Vector3d out = Eigen::Vector3d::Zero();
 
-    // Defensive normalization
     double sw = 0.0; for (double w : ws) sw += w; const double inv_sw = (sw>1e-12)?1.0/sw:1.0;
 
     for (size_t k = 0; k < ids.size(); ++k) {
         const int nid = ids[k];
         const double wk = ws[k] * inv_sw;
 
-        // Read node state from x
-        Eigen::Matrix<double,6,1> se3 = x.segment<6>(offset + 6 * nid);
-        Sophus::SE3d T = Sophus::SE3d::exp(se3);
+        // unpack 12 DoF per node: A (row-major 9) + t (3)
+        const int base = offset + 12 * nid;
+        Eigen::Matrix3d A;
+        A << x(base+0), x(base+1), x(base+2),
+             x(base+3), x(base+4), x(base+5),
+             x(base+6), x(base+7), x(base+8);
+        Eigen::Vector3d t(x(base+9), x(base+10), x(base+11));
 
         const Eigen::Vector3d& g = graph_[nid].position;
-        out += wk * (T.so3() * (v - g) + g + T.translation());
+        out += wk * (A * (v - g) + g + t);
     }
     return out;
 }
@@ -190,16 +189,29 @@ void EDGraph::buildKnnNeighbors(int Ksmooth) {
 void EDGraph::updateFromStateVector(const Eigen::VectorXd& x, int offset) {
     const int G = numNodes();
     for (int i = 0; i < G; ++i) {
-        Eigen::Matrix<double,6,1> se3 = x.segment<6>(offset + 6 * i);
-        graph_[i].transform = Sophus::SE3d::exp(se3);
+        const int base = offset + 12 * i;
+        Eigen::Matrix3d A;
+        A << x(base+0), x(base+1), x(base+2),
+             x(base+3), x(base+4), x(base+5),
+             x(base+6), x(base+7), x(base+8);
+        Eigen::Vector3d t(x(base+9), x(base+10), x(base+11));
+        graph_[i].A = A;
+        graph_[i].t = t;
     }
 }
 
 void EDGraph::writeToStateVector(Eigen::VectorXd& x, int offset) const {
     const int G = numNodes();
-    if (x.size() < offset + 6*G) x.conservativeResize(offset + 6*G); // auto-resize for safety
+    const int need = offset + 12 * G;
+    if (x.size() < need) x.conservativeResize(need);
+
     for (int i = 0; i < G; ++i) {
-        Eigen::Matrix<double,6,1> se3 = graph_[i].transform.log();
-        x.segment<6>(offset + 6 * i) = se3;
+        const int base = offset + 12 * i;
+        const Eigen::Matrix3d& A = graph_[i].A;
+        const Eigen::Vector3d& t = graph_[i].t;
+        x(base+0) = A(0,0); x(base+1) = A(0,1); x(base+2) = A(0,2);
+        x(base+3) = A(1,0); x(base+4) = A(1,1); x(base+5) = A(1,2);
+        x(base+6) = A(2,0); x(base+7) = A(2,1); x(base+8) = A(2,2);
+        x(base+9) = t(0);   x(base+10)= t(1);   x(base+11)= t(2);
     }
 }

@@ -86,6 +86,7 @@ static Eigen::MatrixXd subsampleRows(const Eigen::MatrixXd& X, int maxN) {
     return Y;
 }
 
+// Deform all mesh vertices using a *state vector x*
 static std::vector<Vec3> deformAll(const EDGraph& ed,
                                    const std::vector<MeshModel::Vertex>& V,
                                    const Eigen::VectorXd& x) {
@@ -125,15 +126,23 @@ static double smoothCost(const EDGraph& ed, const Eigen::VectorXd& x) {
     const auto& neigh = ed.getNodeNeighbors();
     double cost = 0.0;
     for (int i = 0; i < G; ++i) {
-        Eigen::Matrix<double,6,1> se3_i = x.segment<6>(6*i);
-        Sophus::SE3d Ti = Sophus::SE3d::exp(se3_i);
+        const int base_i = 12 * i;
+        Eigen::Matrix3d Ai; Vec3 ti;
+        Ai << x(base_i+0), x(base_i+1), x(base_i+2),
+              x(base_i+3), x(base_i+4), x(base_i+5),
+              x(base_i+6), x(base_i+7), x(base_i+8);
+        ti = Vec3(x(base_i+9), x(base_i+10), x(base_i+11));
         const Vec3 gi = nodes[i].position;
         for (int j : neigh[i]) if (j > i) {
-            Eigen::Matrix<double,6,1> se3_j = x.segment<6>(6*j);
-            Sophus::SE3d Tj = Sophus::SE3d::exp(se3_j);
+            const int base_j = 12 * j;
+            Eigen::Matrix3d Aj; Vec3 tj;
+            Aj << x(base_j+0), x(base_j+1), x(base_j+2),
+                  x(base_j+3), x(base_j+4), x(base_j+5),
+                  x(base_j+6), x(base_j+7), x(base_j+8);
+            tj = Vec3(x(base_j+9), x(base_j+10), x(base_j+11));
             const Vec3 gj = nodes[j].position;
-            Vec3 lhs = Ti.so3() * (gj - gi) + gi + Ti.translation();
-            Vec3 rhs = gj + Tj.translation();
+            Vec3 lhs = Ai * (gj - gi) + gi + ti;
+            Vec3 rhs = gj + tj;
             cost += 0.5 * (lhs - rhs).squaredNorm();
         }
     }
@@ -167,7 +176,7 @@ int main(int argc, char** argv) {
     if (!matlab_nodes.empty()) {
         std::vector<DeformationNode> nodes; nodes.reserve(matlab_nodes.size());
         for (const auto& p : matlab_nodes) {
-            DeformationNode n; n.position = p; n.transform = Sophus::SE3d(); nodes.push_back(n);
+            DeformationNode n; n.position = p; n.A.setIdentity(); n.t.setZero(); nodes.push_back(n);
         }
         edgraph.setGraphNodes(nodes);            // exact MATLAB nodes
         edgraph.bindVertices(model.getVertices());
@@ -202,9 +211,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    // 4) Initial state
+    // 4) Initial state (12 DoF per node)
     const int G = edgraph.numNodes();
-    Eigen::VectorXd x0(6 * G);
+    Eigen::VectorXd x0(12 * G);
     edgraph.writeToStateVector(x0, 0);
 
     // 5) INITIAL metrics
@@ -237,11 +246,10 @@ int main(int argc, char** argv) {
     opts.lambda_init = 1e-4;
     opts.eps_jac = 1e-7;
     opts.tol_dx = 1e-6;
-    // MATLAB Gauss-Newton uses diag weights: rotation:1, smooth:0.1, data:0.01 -> sqrt to residual scale
-    opts.w_data            = 0.1;   // sqrt(0.01)
-    opts.w_smooth          = 0.316; // sqrt(0.1)
-    // opts.w_rot_ortho       = 1.0;   // keep small if needed (SE3 already orthogonal)
-    // opts.w_rot_consistency = 0.316; // optional but useful
+    // Residual-scale weights (sqrt of cost weights)
+    opts.w_data            = 0.1;   // data term
+    opts.w_smooth          = 0.316; // smoothness
+    opts.w_ortho           = 0.5;   // orthogonality regularization
     opts.verbose = true;
 
     Eigen::VectorXd x_opt;

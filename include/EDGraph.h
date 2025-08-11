@@ -1,91 +1,80 @@
-#ifndef EDGRAPH_H
-#define EDGRAPH_H
-
+#pragma once
+#include <Eigen/Dense>
 #include <vector>
 #include <unordered_map>
-#include <tuple>
-#include <Eigen/Core>
-#include <sophus/se3.hpp>
+#include <utility>
+#include <cmath>
 #include "MeshModel.h"
 
+// ---- Deformation node (Affine) ----
+// Each node carries a center position (g), an affine 3x3 A, and a translation t
+// v' = A * (v - g) + g + t
 struct DeformationNode {
-    Eigen::Vector3d position;     // node center (rest)
-    Sophus::SE3d    transform;    // current SE3
+    Eigen::Vector3d position;   // g
+    Eigen::Matrix3d A;          // 3x3 affine (rotation/scale/shear)
+    Eigen::Vector3d t;          // translation
+
+    DeformationNode()
+        : position(Eigen::Vector3d::Zero()), A(Eigen::Matrix3d::Identity()), t(Eigen::Vector3d::Zero()) {}
 };
 
 class EDGraph {
 public:
     explicit EDGraph(int K);
 
-    // Build nodes by voxel downsampling (grid_size in same unit as vertices), then bind all vertices
-    void initializeGraph(const std::vector<MeshModel::Vertex>& vertices,
-                         double grid_size);
+    // Build graph nodes via voxel downsampling, then bind vertices (K-NN with base weighting)
+    void initializeGraph(const std::vector<MeshModel::Vertex>& vertices, double grid_size);
 
+    // Directly set nodes (e.g., from MATLAB nodes.txt), then you should call bindVertices()
     void setGraphNodes(const std::vector<DeformationNode>& nodes);
 
-    // Bind each vertex to K nearest nodes (weights use (K+1)-th distance as base; then keep first K)
+    // Bind each mesh vertex to K nearest deformation nodes with base weighting and normalization
     void bindVertices(const std::vector<MeshModel::Vertex>& vertices);
 
-    // Deform a single vertex (by its precomputed binding of vidx)
+    // Build K-NN neighbors over nodes for smoothness priors
+    void buildKnnNeighbors(int Ksmooth);
+
+    // Deform a mesh vertex (using stored node states A,t) by its precomputed weights
     Eigen::Vector3d deformVertex(const MeshModel::Vertex& vertex, int vidx) const;
-    // Overload for convenience when you have Eigen::Vector3d instead of MeshModel::Vertex
+    // Deform a 3D point (using stored node states A,t) by its precomputed weights
     Eigen::Vector3d deformVertex(const Eigen::Vector3d& v, int vidx) const;
 
-    // Evaluate deformation under an EXTERNAL state vector x (does NOT modify internal graph state)
-    // ids/ws are the precomputed binding for the vertex to be deformed.
+    // Deform a 3D point using a *state vector x* instead of stored states (used by optimizer)
+    // x packs [A(3x3)=9, t(3)=3] per node, row-major for A: [a11,a12,a13,a21,...,a33, tx,ty,tz]
     Eigen::Vector3d deformVertexByState(const Eigen::Vector3d& v,
                                         const Eigen::VectorXd& x,
                                         const std::vector<int>& ids,
                                         const std::vector<double>& ws,
                                         int offset) const;
 
-    // Build KNN neighbors per node for smoothness term; typical Ksmooth = num_nearestpts-1 (e.g., 5 when K=6)
-    void buildKnnNeighbors(int Ksmooth);
-
-    // State I/O (6 DoF per node); write will auto-resize target vector
+    // Update internal nodes (A,t) from a state vector x (12 DoF per node)
     void updateFromStateVector(const Eigen::VectorXd& x, int offset);
+
+    // Write internal nodes (A,t) into a state vector x (12 DoF per node)
     void writeToStateVector(Eigen::VectorXd& x, int offset) const;
 
+    // ---- Getters used by optimizer / main ----
     int numNodes() const { return static_cast<int>(graph_.size()); }
 
-    // Optional accessors (useful for debugging/comparison)
+    const std::vector<std::vector<int>>& getBindings() const { return bindings_; }
+    const std::vector<std::vector<double>>& getWeights() const { return weights_; }
     const std::vector<DeformationNode>& getGraphNodes() const { return graph_; }
-    const std::vector<std::vector<int>>&    getBindings() const { return bindings_; }
-    const std::vector<std::vector<double>>& getWeights()  const { return weights_; }
-    const std::vector<std::vector<int>>&    getNodeNeighbors() const { return node_neighbors_; }
+    const std::vector<std::vector<int>>& getNodeNeighbors() const { return node_neighbors_; }
 
 private:
-    // --- voxel downsample internals ---
-    struct VoxelKey { int x, y, z; };
-    struct VoxelKeyHash {
-        std::size_t operator()(const VoxelKey& k) const noexcept {
-            // 3D hash (x,y,z) -> size_t
-            // Use 64-bit mix; assume int fits voxel indices
-            const uint64_t p1 = 73856093u, p2 = 19349663u, p3 = 83492791u;
-            // cast to uint
-            uint64_t ux = static_cast<uint64_t>(static_cast<uint32_t>(k.x));
-            uint64_t uy = static_cast<uint64_t>(static_cast<uint32_t>(k.y));
-            uint64_t uz = static_cast<uint64_t>(static_cast<uint32_t>(k.z));
-            return static_cast<std::size_t>((ux * p1) ^ (uy * p2) ^ (uz * p3));
-        }
-    };
-    struct VoxelKeyEq {
-        bool operator()(const VoxelKey& a, const VoxelKey& b) const noexcept {
-            return a.x==b.x && a.y==b.y && a.z==b.z;
-        }
-    };
-
+    // Helper: voxel downsample to create nodes (positions = voxel means)
     void voxelDownsample(const std::vector<MeshModel::Vertex>& vertices,
                          double grid_size,
                          std::vector<DeformationNode>& out_nodes) const;
 
 private:
-    int K_ = 4;  // number of bound nodes per vertex
+    int K_;  // number of bindings per vertex (K-nearest)
 
-    std::vector<DeformationNode>       graph_;          // nodes
-    std::vector<std::vector<int>>      bindings_;       // per-vertex node ids
-    std::vector<std::vector<double>>   weights_;        // per-vertex weights (sum to 1)
-    std::vector<std::vector<int>>      node_neighbors_; // per-node neighbor ids for smoothness
+    // Graph state
+    std::vector<DeformationNode> graph_;              // nodes (A,t stored here)
+    std::vector<std::vector<int>> node_neighbors_;    // K-NN over nodes for smoothness
+
+    // Bindings
+    std::vector<std::vector<int>> bindings_;          // per-vertex bound node indices
+    std::vector<std::vector<double>> weights_;        // per-vertex normalized weights
 };
-
-#endif // EDGRAPH_H
