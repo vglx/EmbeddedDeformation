@@ -69,41 +69,47 @@ void EDGraph::bindVertices(const std::vector<MeshModel::Vertex>& vertices) {
     for (size_t i = 0; i < nV; ++i) {
         const Eigen::Vector3d v(vertices[i].x, vertices[i].y, vertices[i].z);
 
-        // Gather distances to all nodes
-        std::vector<std::pair<int,double>> dists; // (node_id, Euclidean distance)
+        // 收集到所有节点的距离
+        std::vector<std::pair<int,double>> dists;
         dists.reserve(G);
         for (int j = 0; j < G; ++j) {
             double dist = (v - graph_[j].position).norm();
             dists.emplace_back(j, dist);
         }
 
-        // Take K+1 nearest to form the base distance (MATLAB-style), then keep first K for weights
-        const int need = std::min(K_ + 1, static_cast<int>(dists.size()));
-        std::nth_element(dists.begin(), dists.begin() + need, dists.end(),
-                         [](const auto& a, const auto& b){ return a.second < b.second; });
+        // 计算 base：第 K+1 小的距离（0-based 第 K_ 位）
+        const int base_rank = std::min(K_, G - 1);  // 防越界
+        std::nth_element(
+            dists.begin(), dists.begin() + base_rank, dists.end(),
+            [](const auto& a, const auto& b){ return a.second < b.second; }
+        );
+        double base = dists[base_rank].second;
+        if (base < 1e-12) base = 1e-12; // 防除零
 
-        // Base distance is the (K+1)-th nearest (protect from zero)
-        double base = dists[need - 1].second;
-        if (base < 1e-12) base = 1e-12;
-
+        // 确保前 K_ 个是真正最近的 K 个（提升稳定性）
         const int kth = std::min(K_, static_cast<int>(dists.size()));
+        std::partial_sort(
+            dists.begin(), dists.begin() + kth, dists.end(),
+            [](const auto& a, const auto& b){ return a.second < b.second; }
+        );
+
+        // 计算权重：w_k = max(0, 1 - d_k / base)，然后归一化
         bindings_[i].resize(kth);
         weights_[i].resize(kth);
-
         double sumw = 0.0;
         for (int k = 0; k < kth; ++k) {
             bindings_[i][k] = dists[k].first;
-            double raw = 1.0 - dists[k].second / base;   // in [0,1] ideally
-            double w   = std::max(0.0, raw);             // clamp negatives
-            weights_[i][k] = w;
+            const double raw = 1.0 - dists[k].second / base;
+            const double w   = std::max(0.0, raw);
+            weights_[i][k]   = w;
             sumw += w;
         }
-
-        // Normalize (fallback to uniform if degenerate)
         if (sumw < 1e-12) {
-            for (int k = 0; k < kth; ++k) weights_[i][k] = 1.0 / std::max(1, kth);
+            // 退化情况：均匀分布
+            const double uni = 1.0 / std::max(1, kth);
+            for (double& w : weights_[i]) w = uni;
         } else {
-            for (int k = 0; k < kth; ++k) weights_[i][k] /= sumw;
+            for (double& w : weights_[i]) w /= sumw;
         }
     }
 }
