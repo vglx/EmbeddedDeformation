@@ -7,6 +7,7 @@
 #include <random>
 #include <algorithm>
 #include <numeric>
+#include <filesystem>
 
 #include <Eigen/Dense>
 
@@ -14,89 +15,38 @@
 #include "EDGraph.h"
 #include "Optimizer.h"
 
+using Vec3 = Eigen::Vector3d;
+namespace fs = std::filesystem;
+
 // -----------------------------
-// Simple ASCII STL loader (NO dedup)
+// Utilities
 // -----------------------------
-bool loadSTL_ASCII(const std::string& filename,
-                   std::vector<Eigen::Vector3d>& vertices,
-                   std::vector<MeshModel::Triangle>& triangles) {
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "Failed to open STL file: " << filename << std::endl;
-        return false;
-    }
-
-    std::string line;
-    std::vector<Eigen::Vector3d> temp_vertices;
-    temp_vertices.reserve(1<<18);
-
-    while (std::getline(file, line)) {
-        auto notspace = [](int ch){ return !std::isspace(ch); };
-        line.erase(line.begin(), std::find_if(line.begin(), line.end(), notspace));
-        if (line.rfind("vertex", 0) == 0) {
-            std::istringstream iss(line.substr(6));
-            double x, y, z; iss >> x >> y >> z;
-            temp_vertices.emplace_back(x, y, z);
-        }
-    }
-    file.close();
-
-    if (temp_vertices.empty() || (temp_vertices.size() % 3 != 0)) {
-        std::cerr << "Invalid ASCII STL: vertex count not divisible by 3." << std::endl;
-        return false;
-    }
-
-    vertices = temp_vertices;             // no dedup, preserve order
-    triangles.clear();
-    triangles.reserve(vertices.size()/3);
-    for (size_t i = 0; i + 2 < vertices.size(); i += 3) {
-        MeshModel::Triangle t; t.v0 = (int)i; t.v1 = (int)(i+1); t.v2 = (int)(i+2);
-        triangles.push_back(t);
-    }
-    return true;
-}
-
-// Load x y z per line
-static std::vector<Eigen::Vector3d> loadXYZ(const std::string& path) {
+static std::vector<Vec3> loadXYZ(const std::string& path) {
     std::ifstream f(path);
-    std::vector<Eigen::Vector3d> pts; pts.reserve(1<<16);
-    double x,y,z;
-    while (f >> x >> y >> z) pts.emplace_back(x,y,z);
+    if (!f.is_open()) { return {}; }
+    std::vector<Vec3> pts; pts.reserve(1<<16);
+    double x,y,z; while (f >> x >> y >> z) pts.emplace_back(x,y,z);
     return pts;
 }
 
-// Map each key to nearest vertex index (for using that vertex's binding weights)
-static std::vector<int> mapToNearestIndex(const std::vector<Eigen::Vector3d>& verts,
-                                          const std::vector<Eigen::Vector3d>& keys) {
-    std::vector<int> idx(keys.size(), -1);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        double best = std::numeric_limits<double>::infinity();
-        int best_id = -1;
-        for (size_t v = 0; v < verts.size(); ++v) {
-            double d = (verts[v] - keys[i]).squaredNorm();
-            if (d < best) { best = d; best_id = (int)v; }
-        }
-        idx[i] = best_id;
-    }
+static std::vector<int> loadIndices1Based(const std::string& path) {
+    std::ifstream f(path);
+    if (!f.is_open()) { return {}; }
+    std::vector<int> idx; idx.reserve(1024);
+    long long v; while (f >> v) idx.push_back(static_cast<int>(v - 1));
     return idx;
 }
 
-// Center the point cloud at origin (match MATLAB centering)
-static void centerPointCloud(std::vector<Eigen::Vector3d>& P) {
-    if (P.empty()) return;
-    Eigen::Vector3d c = Eigen::Vector3d::Zero();
-    for (auto& p: P) c += p; c /= (double)P.size();
-    for (auto& p: P) p -= c;
+static bool loadInt(const std::string& path, int& out_val) {
+    std::ifstream f(path); if (!f.is_open()) return false; f >> out_val; return true;
 }
 
-// -------- Geometry comparison utilities (order-invariant) --------
-static Eigen::MatrixXd toMat(const std::vector<Eigen::Vector3d>& pts) {
+static Eigen::MatrixXd toMat(const std::vector<Vec3>& pts) {
     Eigen::MatrixXd M(pts.size(), 3);
     for (size_t i = 0; i < pts.size(); ++i) M.row((int)i) = pts[i].transpose();
     return M;
 }
 
-// Kabsch (Procrustes without scaling/reflection): find R,t aligning B->A
 static void kabschAlign(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B,
                         Eigen::Matrix3d& R, Eigen::Vector3d& t) {
     Eigen::Vector3d ca = A.colwise().mean();
@@ -107,12 +57,11 @@ static void kabschAlign(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B,
     Eigen::JacobiSVD<Eigen::Matrix3d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
     Eigen::Matrix3d U = svd.matrixU();
     Eigen::Matrix3d V = svd.matrixV();
-    R = V * U.transpose();
-    if (R.determinant() < 0) { V.col(2) *= -1; R = V * U.transpose(); }
-    t = ca - R * cb;
+    Eigen::Matrix3d Rtmp = V * U.transpose();
+    if (Rtmp.determinant() < 0) { V.col(2) *= -1; Rtmp = V * U.transpose(); }
+    R = Rtmp; t = ca - R * cb;
 }
 
-// Brute-force NN distances from P to Q (each P finds nearest in Q). O(N*M)
 static Eigen::VectorXd nnDists(const Eigen::MatrixXd& P, const Eigen::MatrixXd& Q) {
     const int N = (int)P.rows();
     const int M = (int)Q.rows();
@@ -130,112 +79,204 @@ static Eigen::VectorXd nnDists(const Eigen::MatrixXd& P, const Eigen::MatrixXd& 
 
 static Eigen::MatrixXd subsampleRows(const Eigen::MatrixXd& X, int maxN) {
     if ((int)X.rows() <= maxN) return X;
-    std::vector<int> idx(X.rows());
-    std::iota(idx.begin(), idx.end(), 0);
-    std::mt19937 rng(123);
-    std::shuffle(idx.begin(), idx.end(), rng);
+    std::vector<int> idx(X.rows()); std::iota(idx.begin(), idx.end(), 0);
+    std::mt19937 rng(123); std::shuffle(idx.begin(), idx.end(), rng);
     Eigen::MatrixXd Y(maxN, X.cols());
     for (int i = 0; i < maxN; ++i) Y.row(i) = X.row(idx[i]);
     return Y;
 }
 
+static std::vector<Vec3> deformAll(const EDGraph& ed,
+                                   const std::vector<MeshModel::Vertex>& V,
+                                   const Eigen::VectorXd& x) {
+    const auto& B = ed.getBindings();
+    const auto& W = ed.getWeights();
+    std::vector<Vec3> out; out.reserve(V.size());
+    for (size_t i = 0; i < V.size(); ++i) {
+        Vec3 p(V[i].x, V[i].y, V[i].z);
+        out.push_back(ed.deformVertexByState(p, x, B[i], W[i], 0));
+    }
+    return out;
+}
+
+static void keyErrors(const EDGraph& ed,
+                      const std::vector<Vec3>& key_old,
+                      const std::vector<Vec3>& key_new,
+                      const std::vector<int>& key_idx,
+                      const Eigen::VectorXd& x,
+                      double& mean_e, double& rmse_e, double& max_e) {
+    const auto& B = ed.getBindings();
+    const auto& W = ed.getWeights();
+    double sum=0, sum2=0, mx=0; int N = (int)key_old.size();
+    for (int i = 0; i < N; ++i) {
+        int vid = key_idx[i];
+        Vec3 pred = ed.deformVertexByState(key_old[i], x, B[vid], W[vid], 0);
+        double e = (pred - key_new[i]).norm();
+        sum += e; sum2 += e*e; mx = std::max(mx, e);
+    }
+    mean_e = sum / std::max(1, N);
+    rmse_e = std::sqrt(sum2 / std::max(1, N));
+    max_e  = mx;
+}
+
+static double smoothCost(const EDGraph& ed, const Eigen::VectorXd& x) {
+    const int G = ed.numNodes();
+    const auto& nodes = ed.getGraphNodes();
+    const auto& neigh = ed.getNodeNeighbors();
+    double cost = 0.0;
+    for (int i = 0; i < G; ++i) {
+        Eigen::Matrix<double,6,1> se3_i = x.segment<6>(6*i);
+        Sophus::SE3d Ti = Sophus::SE3d::exp(se3_i);
+        const Vec3 gi = nodes[i].position;
+        for (int j : neigh[i]) if (j > i) {
+            Eigen::Matrix<double,6,1> se3_j = x.segment<6>(6*j);
+            Sophus::SE3d Tj = Sophus::SE3d::exp(se3_j);
+            const Vec3 gj = nodes[j].position;
+            Vec3 lhs = Ti.so3() * (gj - gi) + gi + Ti.translation();
+            Vec3 rhs = gj + Tj.translation();
+            cost += 0.5 * (lhs - rhs).squaredNorm();
+        }
+    }
+    return cost;
+}
+
 int main(int argc, char** argv) {
-    std::string stl_file = (argc > 1 ? argv[1] : std::string("model_ascii.stl"));
+    // --- 0) Read vertices directly from MATLAB export ---
+    std::vector<Vec3> original_points = loadXYZ("v_init.txt");
+    if (original_points.empty()) {
+        std::cerr << "[ERR] v_init.txt missing or empty. Export it from MATLAB after centering vout1." << std::endl;
+        return -1;
+    }
 
-    // 1) Load STL (no dedup)
-    std::vector<Eigen::Vector3d> original_points;
-    std::vector<MeshModel::Triangle> triangles;
-    if (!loadSTL_ASCII(stl_file, original_points, triangles)) return -1;
-
-    // 2) Center
-    centerPointCloud(original_points);
-
-    // 3) Build MeshModel
+    // 1) Build MeshModel with EXACT order
     MeshModel model;
     std::vector<MeshModel::Vertex> mesh_vs; mesh_vs.reserve(original_points.size());
     for (const auto& p : original_points) {
-        MeshModel::Vertex v; v.x = p.x(); v.y = p.y(); v.z = p.z();
-        v.nx = v.ny = v.nz = 0.0; mesh_vs.push_back(v);
+        MeshModel::Vertex v; v.x = p.x(); v.y = p.y(); v.z = p.z(); v.nx=v.ny=v.nz=0.0; mesh_vs.push_back(v);
     }
     model.setVertices(mesh_vs);
-    model.setTriangles(triangles);
 
-    // 4) Build ED graph via voxel downsampling (grid_size = 20) and bind vertices
-    EDGraph edgraph(/*K_bind=*/6);
-    edgraph.initializeGraph(model.getVertices(), /*grid_size=*/20.0);
-    edgraph.buildKnnNeighbors(/*Ksmooth=*/5); // match MATLAB: num_nearestpts-1
+    // 2) Read K and nodes if present
+    int K_bind = 6; loadInt("num_nearestpts.txt", K_bind);
+    const int Ksmooth = std::max(1, K_bind - 1);
 
-    // 5) Load MATLAB keypoints and map to nearest vertex indices
-    std::vector<Eigen::Vector3d> key_old = loadXYZ("../key_old.txt");
-    std::vector<Eigen::Vector3d> key_new = loadXYZ("../key_new.txt");
-    if (key_old.empty() || key_new.empty() || key_old.size() != key_new.size()) {
-        std::cerr << "Keypoints invalid: key_old/new missing or size mismatch" << std::endl;
-        return -1;
+    EDGraph edgraph(/*K=*/K_bind);
+
+    // Prefer MATLAB nodes.txt when available
+    std::vector<Vec3> matlab_nodes = loadXYZ("nodes.txt");
+    if (!matlab_nodes.empty()) {
+        std::vector<DeformationNode> nodes; nodes.reserve(matlab_nodes.size());
+        for (const auto& p : matlab_nodes) {
+            DeformationNode n; n.position = p; n.transform = Sophus::SE3d(); nodes.push_back(n);
+        }
+        edgraph.setGraphNodes(nodes);            // exact MATLAB nodes
+        edgraph.bindVertices(model.getVertices());
+        edgraph.buildKnnNeighbors(Ksmooth);
+        std::cout << "[Nodes] Using MATLAB nodes.txt (" << nodes.size() << ")\n";
+    } else {
+        // fallback: voxelize from vertices (kept for completeness)
+        const double grid_size = 20.0; // default matches MATLAB
+        edgraph.initializeGraph(model.getVertices(), grid_size);
+        edgraph.buildKnnNeighbors(Ksmooth);
+        std::cout << "[Nodes] MATLAB nodes.txt not found. Using voxel init.\n";
     }
-    std::vector<int> key_indices = mapToNearestIndex(original_points, key_old);
 
-    // 6) Initialize state and optimize (data + smooth)
+    std::cout << "[Config] verts=" << model.getVertices().size()
+              << "  nodes=" << edgraph.numNodes()
+              << "  K_bind=" << K_bind
+              << "  Ksmooth=" << Ksmooth << "\n";
+
+    // 3) Load MATLAB keypoints and EXACT indices
+    std::vector<Vec3> key_old = loadXYZ("key_old.txt");
+    std::vector<Vec3> key_new = loadXYZ("key_new.txt");
+    std::vector<int>  key_indices = loadIndices1Based("key_idx.txt");
+    if (key_old.empty() || key_new.empty() || key_old.size() != key_new.size()) {
+        std::cerr << "[ERR] key_old.txt/key_new.txt missing or size mismatch." << std::endl; return -1;
+    }
+    if (key_indices.size() != key_old.size()) {
+        std::cerr << "[ERR] key_idx.txt size mismatch (expect same length as key_old)." << std::endl; return -1;
+    }
+    for (size_t i = 0; i < key_indices.size(); ++i) {
+        if (key_indices[i] < 0 || key_indices[i] >= (int)mesh_vs.size()) {
+            std::cerr << "[ERR] key_idx out of range at i=" << i << ": " << key_indices[i] << std::endl; return -1;
+        }
+    }
+
+    // 4) Initial state
     const int G = edgraph.numNodes();
     Eigen::VectorXd x0(6 * G);
     edgraph.writeToStateVector(x0, 0);
 
+    // 5) INITIAL metrics
+    double kmean0, krmse0, kmax0; keyErrors(edgraph, key_old, key_new, key_indices, x0, kmean0, krmse0, kmax0);
+    double smooth0 = smoothCost(edgraph, x0);
+    std::cout << "[Init]   key_mean=" << kmean0 << "  key_rmse=" << krmse0 << "  key_max=" << kmax0
+              << "  smooth_cost=" << smooth0 << "\n";
+
+    // Optional: compare to MATLAB deformed, if available
+    auto compareToMatlab = [&](const Eigen::VectorXd& x, const char* tag){
+        std::ifstream test("deformed_matlab.txt"); if (!test.good()) return; // skip silently
+        std::vector<Vec3> matlab_pts = loadXYZ("deformed_matlab.txt"); if (matlab_pts.empty()) return;
+        auto def = deformAll(edgraph, model.getVertices(), x);
+        Eigen::MatrixXd A = toMat(matlab_pts); Eigen::MatrixXd B = toMat(def);
+        const int maxN = 120000; A = subsampleRows(A, maxN); B = subsampleRows(B, maxN);
+        Eigen::Matrix3d R; Eigen::Vector3d t; kabschAlign(A, B, R, t);
+        Eigen::MatrixXd B_aligned = (B * R.transpose()).rowwise() + t.transpose();
+        Eigen::VectorXd dA = nnDists(A, B_aligned); Eigen::VectorXd dB = nnDists(B_aligned, A);
+        double rmse = std::sqrt(dA.array().square().mean());
+        double chamfer = dA.mean() + dB.mean();
+        double haus = std::max(dA.maxCoeff(), dB.maxCoeff());
+        std::cout << tag << "  RMSE=" << rmse << "  Chamfer=" << chamfer << "  Hausdorff=" << haus << "\n";
+    };
+    compareToMatlab(x0, "[Init-MATLAB]");
+
+    // 6) Optimize (with MATLAB-style weights)
     Optimizer optimizer;
-    Optimizer::Options opts; // tweak here if needed
-    opts.max_iters = 50;
-    opts.w_data    = 12.0;  // stronger data
-    opts.w_smooth  = 1.0;   // gentle smoothness
+    Optimizer::Options opts; // initialize defaults
+    opts.max_iters = 80;
+    opts.lambda_init = 1e-4;
+    opts.eps_jac = 1e-7;
+    opts.tol_dx = 1e-6;
+    // MATLAB Gauss-Newton uses diag weights: rotation:1, smooth:0.1, data:0.01 -> sqrt to residual scale
+    opts.w_data            = 0.1;   // sqrt(0.01)
+    opts.w_smooth          = 0.316; // sqrt(0.1)
+    // opts.w_rot_ortho       = 1.0;   // keep small if needed (SE3 already orthogonal)
+    // opts.w_rot_consistency = 0.316; // optional but useful
+    opts.verbose = true;
+
     Eigen::VectorXd x_opt;
     optimizer.optimize(x0, x_opt, edgraph, key_old, key_new, key_indices, opts);
-    edgraph.updateFromStateVector(x_opt, 0);
 
-    // 7) Deform all vertices and dump
-    std::vector<Eigen::Vector3d> deformed; deformed.reserve(mesh_vs.size());
-    for (size_t i = 0; i < mesh_vs.size(); ++i) {
-        const auto& mv = mesh_vs[i];
-        deformed.push_back(edgraph.deformVertex(mv, (int)i));
-    }
+    // 7) FINAL metrics
+    double kmean1, krmse1, kmax1; keyErrors(edgraph, key_old, key_new, key_indices, x_opt, kmean1, krmse1, kmax1);
+    double smooth1 = smoothCost(edgraph, x_opt);
+    std::cout << "[Final]  key_mean=" << kmean1 << "  key_rmse=" << krmse1 << "  key_max=" << kmax1
+              << "  smooth_cost=" << smooth1 << "\n";
+    std::cout << "[Delta]  key_rmse_drop=" << ((krmse0 - krmse1) / std::max(1e-12, krmse0) * 100.0) << "%"
+              << "  smooth_drop=" << (smooth0 - smooth1) << "\n";
 
-    // Save for MATLAB comparison
+    compareToMatlab(x_opt, "[Final-MATLAB]");
+
+    // 8) Save deformed
+    auto deformed = deformAll(edgraph, model.getVertices(), x_opt);
     {
-        std::ofstream fout("../deformed_cpp.txt");
+        std::ofstream fout("deformed_cpp.txt");
         for (const auto& p : deformed) fout << p.x() << ' ' << p.y() << ' ' << p.z() << '\n';
         std::cout << "Saved deformed_cpp.txt (" << deformed.size() << " points)\n";
     }
 
-    // 8) If MATLAB output exists, do in-program geometric comparison
-    std::ifstream test("../deformed_matlab.txt");
-    if (test.good()) {
-        std::cout << "\n[Compare] Found deformed_matlab.txt — running alignment & metrics...\n";
-        std::vector<Eigen::Vector3d> matlab_pts = loadXYZ("deformed_matlab.txt");
-        if (matlab_pts.empty()) {
-            std::cerr << "[Compare] deformed_matlab.txt is empty or unreadable.\n";
-            return 0;
-        }
-        Eigen::MatrixXd A = toMat(matlab_pts);
-        Eigen::MatrixXd B = toMat(deformed);
-
-        const int maxN = 120000; // adjust if needed
-        A = subsampleRows(A, maxN);
-        B = subsampleRows(B, maxN);
-
-        Eigen::Matrix3d R; Eigen::Vector3d t;
-        kabschAlign(A, B, R, t);
-        Eigen::MatrixXd B_aligned = (B * R.transpose()).rowwise() + t.transpose();
-
-        Eigen::VectorXd dA = nnDists(A, B_aligned);
-        Eigen::VectorXd dB = nnDists(B_aligned, A);
-
-        double rmse    = std::sqrt(dA.array().square().mean());
-        double chamfer = dA.mean() + dB.mean();
-        double haus    = std::max(dA.maxCoeff(), dB.maxCoeff());
-
-        std::cout << "RMSE (NN-correspondence, after alignment): " << rmse << "\n";
-        std::cout << "Chamfer distance (symmetric mean NN): " << chamfer
-                  << "  [meanA=" << dA.mean() << ", meanB=" << dB.mean() << "]\n";
-        std::cout << "Hausdorff distance: " << haus << "\n";
-    } else {
-        std::cout << "\n[Compare] deformed_matlab.txt not found — skip metrics.\n";
-    }
+    // Optional PLY
+    auto savePLY = [](const std::string& filename, const std::vector<Vec3>& points) {
+        std::ofstream ofs(filename);
+        if (!ofs.is_open()) { std::cerr << "Failed to open: " << filename << '\n'; return; }
+        ofs << "ply\nformat ascii 1.0\n";
+        ofs << "element vertex " << points.size() << "\n";
+        ofs << "property float x\nproperty float y\nproperty float z\nend_header\n";
+        for (const auto& p : points) ofs << p.x() << ' ' << p.y() << ' ' << p.z() << '\n';
+        std::cout << "Saved PLY: " << filename << '\n';
+    };
+    savePLY("original.ply", original_points);
+    savePLY("deformed.ply", deformed);
 
     return 0;
 }
