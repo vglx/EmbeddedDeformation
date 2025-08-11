@@ -166,8 +166,8 @@ int main(int argc, char** argv) {
     edgraph.buildKnnNeighbors(/*Ksmooth=*/5); // match MATLAB: num_nearestpts-1
 
     // 5) Load MATLAB keypoints and map to nearest vertex indices
-    std::vector<Eigen::Vector3d> key_old = loadXYZ("key_old.txt");
-    std::vector<Eigen::Vector3d> key_new = loadXYZ("key_new.txt");
+    std::vector<Eigen::Vector3d> key_old = loadXYZ("../key_old.txt");
+    std::vector<Eigen::Vector3d> key_new = loadXYZ("../key_new.txt");
     if (key_old.empty() || key_new.empty() || key_old.size() != key_new.size()) {
         std::cerr << "Keypoints invalid: key_old/new missing or size mismatch" << std::endl;
         return -1;
@@ -197,13 +197,13 @@ int main(int argc, char** argv) {
 
     // Save for MATLAB comparison
     {
-        std::ofstream fout("deformed_cpp.txt");
+        std::ofstream fout("../deformed_cpp.txt");
         for (const auto& p : deformed) fout << p.x() << ' ' << p.y() << ' ' << p.z() << '\n';
         std::cout << "Saved deformed_cpp.txt (" << deformed.size() << " points)\n";
     }
 
     // 8) If MATLAB output exists, do in-program geometric comparison
-    std::ifstream test("deformed_matlab.txt");
+    std::ifstream test("../deformed_matlab.txt");
     if (test.good()) {
         std::cout << "\n[Compare] Found deformed_matlab.txt — running alignment & metrics...\n";
         std::vector<Eigen::Vector3d> matlab_pts = loadXYZ("deformed_matlab.txt");
