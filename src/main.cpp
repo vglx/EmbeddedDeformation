@@ -86,6 +86,35 @@ static Eigen::MatrixXd subsampleRows(const Eigen::MatrixXd& X, int maxN) {
     return Y;
 }
 
+// ---------- x helpers ----------
+static bool fileExists(const std::string& p){ std::ifstream f(p); return f.good(); }
+
+static bool loadVector(const std::string& path, Eigen::VectorXd& x){
+    std::ifstream f(path); if(!f.is_open()) return false; std::vector<double> vals; vals.reserve(1<<20);
+    double v; while (f >> v) vals.push_back(v); x = Eigen::Map<Eigen::VectorXd>(vals.data(), (int)vals.size()); return true;
+}
+
+static bool saveVector(const std::string& path, const Eigen::VectorXd& x){
+    std::ofstream f(path); if(!f.is_open()) return false; for(int i=0;i<x.size();++i){ f << std::setprecision(17) << x[i] << '\n'; } return true;
+}
+
+// A (3x3) row-major <-> col-major conversions
+static inline void rowToMat3x3(const double* row9, Eigen::Matrix3d& A){
+    A << row9[0], row9[1], row9[2],
+         row9[3], row9[4], row9[5],
+         row9[6], row9[7], row9[8];
+}
+static inline void colToMat3x3(const double* col9, Eigen::Matrix3d& A){
+    A << col9[0], col9[3], col9[6],
+         col9[1], col9[4], col9[7],
+         col9[2], col9[5], col9[8];
+}
+static inline void mat3x3ToRow(const Eigen::Matrix3d& A, double* row9){
+    row9[0]=A(0,0); row9[1]=A(0,1); row9[2]=A(0,2);
+    row9[3]=A(1,0); row9[4]=A(1,1); row9[5]=A(1,2);
+    row9[6]=A(2,0); row9[7]=A(2,1); row9[8]=A(2,2);
+}
+
 // Deform all mesh vertices using a *state vector x*
 static std::vector<Vec3> deformAll(const EDGraph& ed,
                                    const std::vector<MeshModel::Vertex>& V,
@@ -128,17 +157,13 @@ static double smoothCost(const EDGraph& ed, const Eigen::VectorXd& x) {
     for (int i = 0; i < G; ++i) {
         const int base_i = 12 * i;
         Eigen::Matrix3d Ai; Vec3 ti;
-        Ai << x(base_i+0), x(base_i+1), x(base_i+2),
-              x(base_i+3), x(base_i+4), x(base_i+5),
-              x(base_i+6), x(base_i+7), x(base_i+8);
+        rowToMat3x3(&x(base_i), Ai);
         ti = Vec3(x(base_i+9), x(base_i+10), x(base_i+11));
         const Vec3 gi = nodes[i].position;
         for (int j : neigh[i]) if (j > i) {
             const int base_j = 12 * j;
             Eigen::Matrix3d Aj; Vec3 tj;
-            Aj << x(base_j+0), x(base_j+1), x(base_j+2),
-                  x(base_j+3), x(base_j+4), x(base_j+5),
-                  x(base_j+6), x(base_j+7), x(base_j+8);
+            rowToMat3x3(&x(base_j), Aj);
             tj = Vec3(x(base_j+9), x(base_j+10), x(base_j+11));
             const Vec3 gj = nodes[j].position;
             Vec3 lhs = Ai * (gj - gi) + gi + ti;
@@ -239,7 +264,7 @@ int main(int argc, char** argv) {
     };
     compareToMatlab(x0, "[Init-MATLAB]");
 
-    // 6) Optimize (with MATLAB-style weights)
+    // 6) Optimize (with MATLAB-style weights) — NOTE: adjust to your chosen scale
     Optimizer optimizer;
     Optimizer::Options opts; // initialize defaults
     opts.max_iters = 80;
@@ -247,13 +272,17 @@ int main(int argc, char** argv) {
     opts.eps_jac = 1e-7;
     opts.tol_dx = 1e-6;
     // Residual-scale weights (sqrt of cost weights)
-    opts.w_data            = 0.1;   // data term
-    opts.w_smooth          = 0.316; // smoothness
-    opts.w_ortho           = 0.5;   // orthogonality regularization
+    opts.w_data            = 0.1;   // data term (try 10.0 to mimic MATLAB 100 cost weight)
+    opts.w_smooth          = 0.316; // smoothness (try 3.162 for 10)
+    opts.w_ortho           = 0.5;   // orthogonality regularization (try 1.0 for 1)
     opts.verbose = true;
 
     Eigen::VectorXd x_opt;
     optimizer.optimize(x0, x_opt, edgraph, key_old, key_new, key_indices, opts);
+
+    // Save x_opt in row-major layout per node (for MATLAB reading)
+    saveVector("x_cpp.txt", x_opt);
+    std::cout << "Saved x_cpp.txt (" << x_opt.size() << " values)\n";
 
     // 7) FINAL metrics
     double kmean1, krmse1, kmax1; keyErrors(edgraph, key_old, key_new, key_indices, x_opt, kmean1, krmse1, kmax1);
@@ -283,8 +312,8 @@ int main(int argc, char** argv) {
         for (const auto& p : points) ofs << p.x() << ' ' << p.y() << ' ' << p.z() << '\n';
         std::cout << "Saved PLY: " << filename << '\n';
     };
-    savePLY("original.ply", original_points);
-    savePLY("deformed.ply", deformed);
+    // savePLY("original.ply", original_points);
+    // savePLY("deformed.ply", deformed);
 
     return 0;
 }
