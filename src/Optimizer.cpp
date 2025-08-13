@@ -1,224 +1,205 @@
 #include "Optimizer.h"
+#include <Eigen/Dense>
 #include <iostream>
-#include <numeric>
+#include <tuple>
+#include <iomanip>
 
 using Vec3 = Eigen::Vector3d;
 
-namespace {
-// r_data = w_data * (ED_x(key_old) - key_new)
-void eval_residual_data(const Eigen::VectorXd& x,
-                        const EDGraph& edgraph,
-                        const std::vector<Vec3>& key_old,
-                        const std::vector<Vec3>& key_new,
-                        const std::vector<int>& key_indices,
-                        Eigen::VectorXd& r_data,
-                        double w_data)
-{
-    const auto& B = edgraph.getBindings();
-    const auto& W = edgraph.getWeights();
-    const int Nk = static_cast<int>(key_old.size());
-    r_data.resize(3 * Nk);
+Optimizer::Optimizer(const OptimizerOptions& opt) : opt_(opt) {}
 
-    for (int i = 0; i < Nk; ++i) {
-        const int vid = key_indices[i];
-        const auto& ids = B[vid];
-        std::vector<double> ws = W[vid];
-        double s = 0.0; for (double v : ws) s += v; if (s>0) for (double& v : ws) v /= s; // defensive renorm
-        Vec3 pred = edgraph.deformVertexByState(key_old[i], x, ids, ws, /*offset=*/0);
-        r_data.segment<3>(3*i) = w_data * (pred - key_new[i]);
+static inline void unpackA_t(const Eigen::VectorXd& x, int node_id, Eigen::Matrix3d& A, Vec3& t) {
+    const int b = 12*node_id;
+    A << x(b+0),x(b+1),x(b+2),
+         x(b+3),x(b+4),x(b+5),
+         x(b+6),x(b+7),x(b+8);
+    t = Vec3(x(b+9), x(b+10), x(b+11));
+}
+
+void Optimizer::buildResidualVector(const Eigen::VectorXd& x,
+                                    const EDGraph& ed,
+                                    const std::vector<Vec3>& key_old,
+                                    const std::vector<Vec3>& key_new,
+                                    const std::vector<int>& key_idx,
+                                    Eigen::VectorXd& F,
+                                    Eigen::VectorXd& Pdiag,
+                                    int& num_rownode,
+                                    int& G,
+                                    int& Kc) const
+{
+    G  = ed.numNodes();
+    const auto& nodes = ed.getGraphNodes();
+    const auto& neigh = ed.getNodeNeighbors();
+
+    // Deduce K from neighbors: size(neigh[i]) = num_nearestpts-1 typically
+    const int num_nearestpts = (int)neigh.empty() ? 1 : ((int)neigh[0].size() + 1);
+    num_rownode = 6 + 3 * num_nearestpts; // matches MATLAB v_diag sizing
+
+    Kc = (int)key_old.size();
+
+    // Compute total rows: rotation (6 per node) + smoothness (3*|neigh[i]| per node) + data (3*Kc)
+    int total_rows = 0;
+    for (int i = 0; i < G; ++i) total_rows += 6 + 3 * (int)neigh[i].size();
+    total_rows += 3 * Kc;
+
+    F.resize(total_rows);
+    Pdiag.resize(total_rows);
+
+    int row = 0;
+    for (int i = 0; i < G; ++i) {
+        Eigen::Matrix3d A; Vec3 ti; unpackA_t(x, i, A, ti);
+        const Vec3 gi = nodes[i].position;
+        // rotation residuals: 6 rows
+        const Vec3 c0 = A.col(0), c1 = A.col(1), c2 = A.col(2);
+        F[row+0] = c0.dot(c1);
+        F[row+1] = c0.dot(c2);
+        F[row+2] = c1.dot(c2);
+        F[row+3] = c0.squaredNorm() - 1.0;
+        F[row+4] = c1.squaredNorm() - 1.0;
+        F[row+5] = c2.squaredNorm() - 1.0;
+        for (int k=0;k<6;++k) Pdiag[row+k] = opt_.w_rot_rows;
+        row += 6;
+
+        // smoothness residuals: double-count i->j as per MATLAB traversal
+        for (int j : neigh[i]) {
+            Eigen::Matrix3d Aj; Vec3 tj; unpackA_t(x, j, Aj, tj);
+            const Vec3 gj = nodes[j].position;
+            Vec3 rij = A * (gj - gi) + gi + ti - (gj + tj);
+            F.segment<3>(row) = rij;
+            Pdiag.segment<3>(row).setConstant(opt_.w_conn_rows);
+            row += 3;
+        }
+    }
+
+    // data term
+    const auto& B = ed.getVertexBindings();
+    const auto& W = ed.getVertexWeights();
+    for (int k = 0; k < Kc; ++k) {
+        const int vid = key_idx[k];
+        Vec3 pred = ed.deformVertexByState(key_old[k], x, B[vid], W[vid], 0);
+        Vec3 r = pred - key_new[k];
+        F.segment<3>(row) = r;
+        Pdiag.segment<3>(row).setConstant(opt_.w_data_rows);
+        row += 3;
     }
 }
 
-// Smoothness over node graph edges (i<j):
-// r_ij = A_i*(g_j - g_i) + g_i + t_i - (g_j + t_j)
-void eval_residual_smooth(const Eigen::VectorXd& x,
-                          const EDGraph& edgraph,
-                          Eigen::VectorXd& r_smooth,
-                          double w_smooth)
+void Optimizer::numericJacobian(std::function<void(const Eigen::VectorXd&, Eigen::VectorXd&)> f,
+                                const Eigen::VectorXd& x,
+                                Eigen::MatrixXd& J,
+                                double eps) const
 {
-    const int G = edgraph.numNodes();
-    const auto& nodes = edgraph.getGraphNodes();
-    const auto& neigh = edgraph.getNodeNeighbors();
+    Eigen::VectorXd f0; f(x, f0);
+    const int m = (int)f0.size();
+    const int n = (int)x.size();
+    J.resize(m, n);
 
-    // count undirected edges
-    int E = 0; for (int i = 0; i < G; ++i) for (int j : neigh[i]) if (j > i) ++E;
-    r_smooth.resize(3 * E);
+    Eigen::VectorXd xt = x;
+    for (int j = 0; j < n; ++j) {
+        const double h = eps * std::max(1.0, std::abs(x[j]));
+        xt[j] = x[j] + h; Eigen::VectorXd fp; f(xt, fp);
+        xt[j] = x[j] - h; Eigen::VectorXd fm; f(xt, fm);
+        xt[j] = x[j];
+        J.col(j) = (fp - fm) / (2.0*h);
+    }
+}
 
-    auto read_node = [&](int idx, Eigen::Matrix3d& A, Vec3& t){
-        const int base = 12 * idx;
-        A << x(base+0), x(base+1), x(base+2),
-             x(base+3), x(base+4), x(base+5),
-             x(base+6), x(base+7), x(base+8);
-        t = Vec3(x(base+9), x(base+10), x(base+11));
+int sgn(double v){ return (v>0)-(v<0); }
+
+void Optimizer::optimize(EDGraph& edgraph,
+                         Eigen::VectorXd& x,
+                         const std::vector<Vec3>& key_old,
+                         const std::vector<Vec3>& key_new,
+                         const std::vector<int>&   key_indices)
+{
+    // Helper closures
+    auto buildF = [&](const Eigen::VectorXd& xt, Eigen::VectorXd& Fout, Eigen::VectorXd& Pdiag){
+        int nrn, G, Kc; buildResidualVector(xt, edgraph, key_old, key_new, key_indices, Fout, Pdiag, nrn, G, Kc);
+    };
+    auto phi = [&](const Eigen::VectorXd& F, const Eigen::VectorXd& Pdiag){
+        // cost = F' * inv(diag(v_diag)) * F
+        return F.cwiseQuotient(Pdiag).dot(F);
     };
 
-    int e = 0;
-    for (int i = 0; i < G; ++i) {
-        Eigen::Matrix3d Ai; Vec3 ti; read_node(i, Ai, ti);
-        const Vec3 gi = nodes[i].position;
-        for (int j : neigh[i]) if (j > i) {
-            Eigen::Matrix3d Aj; Vec3 tj; read_node(j, Aj, tj);
-            const Vec3 gj = nodes[j].position;
-            Vec3 lhs = Ai * (gj - gi) + gi + ti;
-            Vec3 rhs = gj + tj;
-            r_smooth.segment<3>(3*e) = w_smooth * (lhs - rhs);
-            ++e;
-        }
-    }
-}
+    // initial F,J,H,g,cost
+    Eigen::VectorXd F, Pdiag; buildF(x, F, Pdiag);
+    auto Ffun = [&](const Eigen::VectorXd& xt, Eigen::VectorXd& Fout){ Eigen::VectorXd P; buildF(xt, Fout, P); };
+    Eigen::MatrixXd J; numericJacobian(Ffun, x, J);
 
-// Orthogonality regularization per node:
-// For each node i, r_ortho_i = vec(A_i^T A_i - I)  (9 residuals)
-void eval_residual_ortho(const Eigen::VectorXd& x,
-                         const EDGraph& edgraph,
-                         Eigen::VectorXd& r_ortho,
-                         double w_ortho)
-{
-    const int G = edgraph.numNodes();
-    r_ortho.resize(9 * G);
+    auto assemble = [&](const Eigen::MatrixXd& Jm, const Eigen::VectorXd& Fm, const Eigen::VectorXd& Wdiag){
+        Eigen::VectorXd inv_v = Wdiag.cwiseInverse();
+        Eigen::MatrixXd JP = Jm.transpose() * inv_v.asDiagonal();
+        Eigen::MatrixXd H  = JP * Jm;
+        Eigen::VectorXd g  = JP * Fm;
+        double cost = phi(Fm, Wdiag);
+        return std::make_tuple(H, g, cost);
+    };
 
-    for (int i = 0; i < G; ++i) {
-        const int base = 12 * i;
-        Eigen::Matrix3d A;
-        A << x(base+0), x(base+1), x(base+2),
-             x(base+3), x(base+4), x(base+5),
-             x(base+6), x(base+7), x(base+8);
-        Eigen::Matrix3d M = A.transpose() * A - Eigen::Matrix3d::Identity();
-        // vec in row-major order
-        r_ortho.segment<9>(9*i) << M(0,0), M(0,1), M(0,2),
-                                   M(1,0), M(1,1), M(1,2),
-                                   M(2,0), M(2,1), M(2,2);
-    }
-    r_ortho *= w_ortho;
-}
+    Eigen::MatrixXd H; Eigen::VectorXd g; double cost; std::tie(H,g,cost) = assemble(J,F,Pdiag);
+    if (opt_.verbose) std::cout << "[GN] init cost_P=" << std::setprecision(12) << cost << "  n=" << x.size() << "  m=" << F.size() << "\n";
 
-// Build full residual r = [r_data; r_smooth; r_ortho]
-void eval_residuals_full(const Eigen::VectorXd& x,
-                         const EDGraph& edgraph,
-                         const std::vector<Vec3>& key_old,
-                         const std::vector<Vec3>& key_new,
-                         const std::vector<int>& key_indices,
-                         Eigen::VectorXd& r,
-                         double& cost_data,
-                         double& cost_smooth,
-                         double& cost_ortho,
-                         double w_data,
-                         double w_smooth,
-                         double w_ortho)
-{
-    Eigen::VectorXd r_data, r_smooth, r_ortho;
-    eval_residual_data(x, edgraph, key_old, key_new, key_indices, r_data,  w_data);
-    eval_residual_smooth(x, edgraph, r_smooth, w_smooth);
-    eval_residual_ortho(x, edgraph, r_ortho, w_ortho);
+    double prev_cost = 1e300;
+    int it = 0;
+    for (; it < opt_.max_iters; ++it) {
+        // Gauss-Newton direction: d = -(J' P J)^{-1} J' P F
+        Eigen::VectorXd d = H.ldlt().solve(-g);
 
-    r.resize(r_data.size() + r_smooth.size() + r_ortho.size());
-    r << r_data, r_smooth, r_ortho;
+        // Line search (match MATLAB LineSearch logic)
+        const double phi0 = cost;
+        const double phi0_deriv = d.dot(g); // since g = J' P F
+        double alpha = opt_.alpha0;
+        double step  = opt_.step0;
 
-    cost_data   = 0.5 * r_data.squaredNorm();
-    cost_smooth = 0.5 * r_smooth.squaredNorm();
-    cost_ortho  = 0.5 * r_ortho.squaredNorm();
-}
-}
+        auto eval_at = [&](double a){
+            Eigen::VectorXd xt = x + a * d;
+            Eigen::VectorXd Ft, Pt; buildF(xt, Ft, Pt);
+            // derivative at a uses current J at xt. We approximate J at xt with numeric Jacobian for fidelity
+            Eigen::MatrixXd Jt; numericJacobian(Ffun, xt, Jt);
+            double phit = phi(Ft, Pt);
+            // phi'(a) = d' * J(xt)' * P * F(xt) = d' * (Jt' * inv(D) * Ft)
+            Eigen::VectorXd inv_v = Pt.cwiseInverse();
+            Eigen::VectorXd gt = Jt.transpose() * (inv_v.asDiagonal() * Ft);
+            double phit_deriv = d.dot(gt);
+            return std::tuple<double,double,Eigen::VectorXd,Eigen::VectorXd,Eigen::MatrixXd>(phit, phit_deriv, Ft, Pt, Jt);
+        };
 
-void Optimizer::optimize(const Eigen::VectorXd& x0,
-                         Eigen::VectorXd& x_opt,
-                         EDGraph& edgraph,
-                         const std::vector<Vec3>& key_old,
-                         const std::vector<Vec3>& key_new,
-                         const std::vector<int>& key_indices,
-                         const Options& opt)
-{
-    const int DoF = static_cast<int>(x0.size());
-    x_opt = x0;
-
-    auto cost_total = [](const Eigen::VectorXd& r){ return 0.5 * r.squaredNorm(); };
-
-    // Initial residual/cost
-    Eigen::VectorXd r;
-    double c_data=0, c_smooth=0, c_ortho=0;
-    eval_residuals_full(x_opt, edgraph, key_old, key_new, key_indices,
-                        r, c_data, c_smooth, c_ortho,
-                        opt.w_data, opt.w_smooth, opt.w_ortho);
-    double cost = cost_total(r);
-    if (opt.verbose) std::cout << "[LM] init: cost=" << cost
-                               << "  (data=" << c_data
-                               << ", smooth=" << c_smooth
-                               << ", ortho=" << c_ortho << ")\n";
-
-    double lambda = opt.lambda_init;
-
-    for (int it = 0; it < opt.max_iters; ++it) {
-        // Central-difference Jacobian
-        Eigen::MatrixXd J(r.size(), DoF);
-        Eigen::VectorXd r_plus, r_minus;
-        for (int j = 0; j < DoF; ++j) {
-            Eigen::VectorXd x_p = x_opt; x_p(j) += opt.eps_jac;
-            Eigen::VectorXd x_m = x_opt; x_m(j) -= opt.eps_jac;
-            double d1, d2, d3; // throwaways
-            eval_residuals_full(x_p, edgraph, key_old, key_new, key_indices,
-                                r_plus, d1, d2, d3,
-                                opt.w_data, opt.w_smooth, opt.w_ortho);
-            eval_residuals_full(x_m, edgraph, key_old, key_new, key_indices,
-                                r_minus, d1, d2, d3,
-                                opt.w_data, opt.w_smooth, opt.w_ortho);
-            J.col(j) = (r_plus - r_minus) / (2.0 * opt.eps_jac);
+        // Check Wolfe-like conditions (same sense as MATLAB's LineSearch)
+        int k = 0; bool ok = false; double phia, dphia; Eigen::VectorXd Fa, Pa; Eigen::MatrixXd Ja;
+        while (k < 10) {
+            double phit, dphit; Eigen::VectorXd Ft, Pt; Eigen::MatrixXd Jt;
+            std::tie(phit, dphit, Ft, Pt, Jt) = eval_at(alpha);
+            bool cond1 = (phit <= phi0 + opt_.gamma1 * phi0_deriv * alpha);
+            bool cond2 = (dphit >= opt_.gamma2 * phi0_deriv);
+            if (cond1 && cond2) { ok = true; phia = phit; dphia = dphit; Fa = Ft; Pa = Pt; Ja = Jt; break; }
+            // adjust alpha (simple bracket/zoom alternative similar to MATLAB code)
+            if (!cond1) { alpha -= step; step *= 0.5; }
+            else if (!cond2) { alpha += step; step *= 0.5; }
+            if (alpha <= 1e-12) break;
+            ++k;
         }
 
-        Eigen::MatrixXd H = J.transpose() * J;
-        Eigen::VectorXd g = -J.transpose() * r;
-        H += lambda * Eigen::MatrixXd::Identity(DoF, DoF);
-
-        Eigen::VectorXd dx = H.ldlt().solve(g);
-        if (!dx.allFinite()) { std::cerr << "[LM] non-finite dx; abort.\n"; break; }
-        if (dx.norm() < opt.tol_dx) {
-            if (opt.verbose) std::cout << "[LM] Converged by |dx| at iter " << it << "\n";
-            break;
+        if (!ok) {
+            if (opt_.verbose) std::cout << "[GN] it=" << it << "  line-search failed, alpha→0" << "\n";
+            break; // cannot find a good step
         }
 
-        // Try step
-        Eigen::VectorXd x_new = x_opt + dx;
-        Eigen::VectorXd r_new; double cd_new=0, cs_new=0, co_new=0;
-        eval_residuals_full(x_new, edgraph, key_old, key_new, key_indices,
-                            r_new, cd_new, cs_new, co_new,
-                            opt.w_data, opt.w_smooth, opt.w_ortho);
-        double cost_new = cost_total(r_new);
+        // Accept step
+        x += alpha * d;
+        F.swap(Fa); Pdiag.swap(Pa); J.swap(Ja); cost = phia;
 
-        if (cost_new < cost) {
-            // Accept
-            x_opt = x_new; r = r_new; cost = cost_new;
-            c_data = cd_new; c_smooth = cs_new; c_ortho = co_new;
-            lambda = std::max(1e-10, lambda * 0.5);
-            if (opt.verbose) std::cout << "[LM] it=" << it
-                                       << "  cost=" << cost
-                                       << "  (data=" << c_data
-                                       << ", smooth=" << c_smooth
-                                       << ", ortho=" << c_ortho << ")"
-                                       << "  lambda=" << lambda
-                                       << "  (accept)\n";
-        } else {
-            // Reject and increase lambda; retry a few times
-            bool accepted = false; double try_cost = cost_new;
-            for (int rep = 0; rep < 4; ++rep) {
-                lambda *= 4.0;
-                Eigen::MatrixXd H2 = J.transpose()*J + lambda * Eigen::MatrixXd::Identity(DoF, DoF);
-                dx = H2.ldlt().solve(g);
-                if (!dx.allFinite()) break;
-                x_new = x_opt + dx;
-                eval_residuals_full(x_new, edgraph, key_old, key_new, key_indices,
-                                    r_new, cd_new, cs_new, co_new,
-                                    opt.w_data, opt.w_smooth, opt.w_ortho);
-                try_cost = cost_total(r_new);
-                if (try_cost < cost) { x_opt = x_new; r = r_new; cost = try_cost;
-                    c_data = cd_new; c_smooth = cs_new; c_ortho = co_new; accepted = true; break; }
-            }
-            if (opt.verbose) std::cout << "[LM] it=" << it
-                                       << "  try_cost=" << try_cost
-                                       << "  lambda=" << lambda
-                                       << (accepted ? "  (accepted after damping)\n" : "  (rejected)\n");
-            if (!accepted) break;
-        }
+        if (opt_.verbose) std::cout << "[GN] it=" << it << "  cost_P=" << std::setprecision(12) << cost
+                                     << "  alpha=" << alpha << "  |d|=" << d.norm() << "\n";
+
+        // Convergence checks (match MATLAB spirit)
+        if (cost < opt_.tol_cost) break;
+        if (std::abs(prev_cost - cost) < opt_.tol_cost) break;
+        prev_cost = cost;
+
+        // Recompute H,g at new x
+        std::tie(H,g,std::ignore) = assemble(J,F,Pdiag); // Ja corresponds to x_new; reuse to build H,g quickly
     }
 
-    // Update EDGraph state for downstream use
-    edgraph.updateFromStateVector(x_opt, 0);
+    if (opt_.verbose) std::cout << "[GN] finished iters=" << it << "  final cost_P=" << std::setprecision(12) << cost << "\n";
+
+    edgraph.updateFromStateVector(x, 0);
 }

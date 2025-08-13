@@ -1,12 +1,12 @@
 #include <iostream>
 #include <fstream>
-#include <sstream>
+#include <iomanip>
 #include <vector>
 #include <string>
-#include <limits>
 #include <random>
 #include <algorithm>
 #include <numeric>
+#include <limits>
 #include <filesystem>
 
 #include <Eigen/Dense>
@@ -41,86 +41,17 @@ static bool loadInt(const std::string& path, int& out_val) {
     std::ifstream f(path); if (!f.is_open()) return false; f >> out_val; return true;
 }
 
-static Eigen::MatrixXd toMat(const std::vector<Vec3>& pts) {
-    Eigen::MatrixXd M(pts.size(), 3);
-    for (size_t i = 0; i < pts.size(); ++i) M.row((int)i) = pts[i].transpose();
-    return M;
-}
-
-static void kabschAlign(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B,
-                        Eigen::Matrix3d& R, Eigen::Vector3d& t) {
-    Eigen::Vector3d ca = A.colwise().mean();
-    Eigen::Vector3d cb = B.colwise().mean();
-    Eigen::MatrixXd Ac = A.rowwise() - ca.transpose();
-    Eigen::MatrixXd Bc = B.rowwise() - cb.transpose();
-    Eigen::Matrix3d H = Bc.transpose() * Ac;
-    Eigen::JacobiSVD<Eigen::Matrix3d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
-    Eigen::Matrix3d U = svd.matrixU();
-    Eigen::Matrix3d V = svd.matrixV();
-    Eigen::Matrix3d Rtmp = V * U.transpose();
-    if (Rtmp.determinant() < 0) { V.col(2) *= -1; Rtmp = V * U.transpose(); }
-    R = Rtmp; t = ca - R * cb;
-}
-
-static Eigen::VectorXd nnDists(const Eigen::MatrixXd& P, const Eigen::MatrixXd& Q) {
-    const int N = (int)P.rows();
-    const int M = (int)Q.rows();
-    Eigen::VectorXd d(N);
-    for (int i = 0; i < N; ++i) {
-        double best = std::numeric_limits<double>::infinity();
-        for (int j = 0; j < M; ++j) {
-            double dd = (P.row(i) - Q.row(j)).squaredNorm();
-            if (dd < best) best = dd;
-        }
-        d[i] = std::sqrt(best);
-    }
-    return d;
-}
-
-static Eigen::MatrixXd subsampleRows(const Eigen::MatrixXd& X, int maxN) {
-    if ((int)X.rows() <= maxN) return X;
-    std::vector<int> idx(X.rows()); std::iota(idx.begin(), idx.end(), 0);
-    std::mt19937 rng(123); std::shuffle(idx.begin(), idx.end(), rng);
-    Eigen::MatrixXd Y(maxN, X.cols());
-    for (int i = 0; i < maxN; ++i) Y.row(i) = X.row(idx[i]);
-    return Y;
-}
-
-// ---------- x helpers ----------
-static bool fileExists(const std::string& p){ std::ifstream f(p); return f.good(); }
-
-static bool loadVector(const std::string& path, Eigen::VectorXd& x){
-    std::ifstream f(path); if(!f.is_open()) return false; std::vector<double> vals; vals.reserve(1<<20);
-    double v; while (f >> v) vals.push_back(v); x = Eigen::Map<Eigen::VectorXd>(vals.data(), (int)vals.size()); return true;
-}
-
 static bool saveVector(const std::string& path, const Eigen::VectorXd& x){
-    std::ofstream f(path); if(!f.is_open()) return false; for(int i=0;i<x.size();++i){ f << std::setprecision(17) << x[i] << '\n'; } return true;
+    std::ofstream f(path); if(!f.is_open()) return false; 
+    for(int i=0;i<x.size();++i){ f << std::setprecision(17) << x[i] << '\n'; }
+    return true;
 }
 
-// A (3x3) row-major <-> col-major conversions
-static inline void rowToMat3x3(const double* row9, Eigen::Matrix3d& A){
-    A << row9[0], row9[1], row9[2],
-         row9[3], row9[4], row9[5],
-         row9[6], row9[7], row9[8];
-}
-static inline void colToMat3x3(const double* col9, Eigen::Matrix3d& A){
-    A << col9[0], col9[3], col9[6],
-         col9[1], col9[4], col9[7],
-         col9[2], col9[5], col9[8];
-}
-static inline void mat3x3ToRow(const Eigen::Matrix3d& A, double* row9){
-    row9[0]=A(0,0); row9[1]=A(0,1); row9[2]=A(0,2);
-    row9[3]=A(1,0); row9[4]=A(1,1); row9[5]=A(1,2);
-    row9[6]=A(2,0); row9[7]=A(2,1); row9[8]=A(2,2);
-}
-
-// Deform all mesh vertices using a *state vector x*
 static std::vector<Vec3> deformAll(const EDGraph& ed,
                                    const std::vector<MeshModel::Vertex>& V,
                                    const Eigen::VectorXd& x) {
-    const auto& B = ed.getBindings();
-    const auto& W = ed.getWeights();
+    const auto& B = ed.getVertexBindings();
+    const auto& W = ed.getVertexWeights();
     std::vector<Vec3> out; out.reserve(V.size());
     for (size_t i = 0; i < V.size(); ++i) {
         Vec3 p(V[i].x, V[i].y, V[i].z);
@@ -135,8 +66,8 @@ static void keyErrors(const EDGraph& ed,
                       const std::vector<int>& key_idx,
                       const Eigen::VectorXd& x,
                       double& mean_e, double& rmse_e, double& max_e) {
-    const auto& B = ed.getBindings();
-    const auto& W = ed.getWeights();
+    const auto& B = ed.getVertexBindings();
+    const auto& W = ed.getVertexWeights();
     double sum=0, sum2=0, mx=0; int N = (int)key_old.size();
     for (int i = 0; i < N; ++i) {
         int vid = key_idx[i];
@@ -153,18 +84,18 @@ static double smoothCost(const EDGraph& ed, const Eigen::VectorXd& x) {
     const int G = ed.numNodes();
     const auto& nodes = ed.getGraphNodes();
     const auto& neigh = ed.getNodeNeighbors();
+    auto rowToMat3 = [](const double* row9){
+        Eigen::Matrix3d A; A << row9[0],row9[1],row9[2], row9[3],row9[4],row9[5], row9[6],row9[7],row9[8]; return A; };
+
     double cost = 0.0;
     for (int i = 0; i < G; ++i) {
-        const int base_i = 12 * i;
-        Eigen::Matrix3d Ai; Vec3 ti;
-        rowToMat3x3(&x(base_i), Ai);
-        ti = Vec3(x(base_i+9), x(base_i+10), x(base_i+11));
+        const int bi = 12 * i;
+        Eigen::Matrix3d Ai = rowToMat3(&x(bi));
+        Vec3 ti(x(bi+9), x(bi+10), x(bi+11));
         const Vec3 gi = nodes[i].position;
         for (int j : neigh[i]) if (j > i) {
-            const int base_j = 12 * j;
-            Eigen::Matrix3d Aj; Vec3 tj;
-            rowToMat3x3(&x(base_j), Aj);
-            tj = Vec3(x(base_j+9), x(base_j+10), x(base_j+11));
+            const int bj = 12 * j;
+            Vec3 tj(x(bj+9), x(bj+10), x(bj+11));
             const Vec3 gj = nodes[j].position;
             Vec3 lhs = Ai * (gj - gi) + gi + ti;
             Vec3 rhs = gj + tj;
@@ -175,14 +106,14 @@ static double smoothCost(const EDGraph& ed, const Eigen::VectorXd& x) {
 }
 
 int main(int argc, char** argv) {
-    // --- 0) Read vertices directly from MATLAB export ---
+    // 0) Load original vertices (centered)
     std::vector<Vec3> original_points = loadXYZ("v_init.txt");
     if (original_points.empty()) {
         std::cerr << "[ERR] v_init.txt missing or empty. Export it from MATLAB after centering vout1." << std::endl;
         return -1;
     }
 
-    // 1) Build MeshModel with EXACT order
+    // 1) Build MeshModel (preserves vertex order)
     MeshModel model;
     std::vector<MeshModel::Vertex> mesh_vs; mesh_vs.reserve(original_points.size());
     for (const auto& p : original_points) {
@@ -190,29 +121,28 @@ int main(int argc, char** argv) {
     }
     model.setVertices(mesh_vs);
 
-    // 2) Read K and nodes if present
+    // 2) Read K and nodes
     int K_bind = 6; loadInt("num_nearestpts.txt", K_bind);
     const int Ksmooth = std::max(1, K_bind - 1);
 
     EDGraph edgraph(/*K=*/K_bind);
 
-    // Prefer MATLAB nodes.txt when available
+    // Prefer MATLAB nodes.txt when available (exact node positions)
     std::vector<Vec3> matlab_nodes = loadXYZ("nodes.txt");
     if (!matlab_nodes.empty()) {
         std::vector<DeformationNode> nodes; nodes.reserve(matlab_nodes.size());
         for (const auto& p : matlab_nodes) {
             DeformationNode n; n.position = p; n.A.setIdentity(); n.t.setZero(); nodes.push_back(n);
         }
-        edgraph.setGraphNodes(nodes);            // exact MATLAB nodes
+        edgraph.setGraphNodes(nodes);
         edgraph.bindVertices(model.getVertices());
         edgraph.buildKnnNeighbors(Ksmooth);
         std::cout << "[Nodes] Using MATLAB nodes.txt (" << nodes.size() << ")\n";
     } else {
-        // fallback: voxelize from vertices (kept for completeness)
         const double grid_size = 20.0; // default matches MATLAB
         edgraph.initializeGraph(model.getVertices(), grid_size);
         edgraph.buildKnnNeighbors(Ksmooth);
-        std::cout << "[Nodes] MATLAB nodes.txt not found. Using voxel init.\n";
+        std::cout << "[Nodes] MATLAB nodes.txt not found. Using voxel init." << "\n";
     }
 
     std::cout << "[Config] verts=" << model.getVertices().size()
@@ -236,84 +166,48 @@ int main(int argc, char** argv) {
         }
     }
 
-    // 4) Initial state (12 DoF per node)
+    // 4) Initial state vector x (A=I, t=0 per node)
     const int G = edgraph.numNodes();
-    Eigen::VectorXd x0(12 * G);
-    edgraph.writeToStateVector(x0, 0);
+    Eigen::VectorXd x(12 * G);
+    edgraph.writeToStateVector(x, 0);
 
     // 5) INITIAL metrics
-    double kmean0, krmse0, kmax0; keyErrors(edgraph, key_old, key_new, key_indices, x0, kmean0, krmse0, kmax0);
-    double smooth0 = smoothCost(edgraph, x0);
+    double kmean0, krmse0, kmax0; keyErrors(edgraph, key_old, key_new, key_indices, x, kmean0, krmse0, kmax0);
+    double smooth0 = smoothCost(edgraph, x);
     std::cout << "[Init]   key_mean=" << kmean0 << "  key_rmse=" << krmse0 << "  key_max=" << kmax0
               << "  smooth_cost=" << smooth0 << "\n";
 
-    // Optional: compare to MATLAB deformed, if available
-    auto compareToMatlab = [&](const Eigen::VectorXd& x, const char* tag){
-        std::ifstream test("deformed_matlab.txt"); if (!test.good()) return; // skip silently
-        std::vector<Vec3> matlab_pts = loadXYZ("deformed_matlab.txt"); if (matlab_pts.empty()) return;
-        auto def = deformAll(edgraph, model.getVertices(), x);
-        Eigen::MatrixXd A = toMat(matlab_pts); Eigen::MatrixXd B = toMat(def);
-        const int maxN = 120000; A = subsampleRows(A, maxN); B = subsampleRows(B, maxN);
-        Eigen::Matrix3d R; Eigen::Vector3d t; kabschAlign(A, B, R, t);
-        Eigen::MatrixXd B_aligned = (B * R.transpose()).rowwise() + t.transpose();
-        Eigen::VectorXd dA = nnDists(A, B_aligned); Eigen::VectorXd dB = nnDists(B_aligned, A);
-        double rmse = std::sqrt(dA.array().square().mean());
-        double chamfer = dA.mean() + dB.mean();
-        double haus = std::max(dA.maxCoeff(), dB.maxCoeff());
-        std::cout << tag << "  RMSE=" << rmse << "  Chamfer=" << chamfer << "  Hausdorff=" << haus << "\n";
-    };
-    compareToMatlab(x0, "[Init-MATLAB]");
+    // 6) Optimize — MATLAB-equivalent P-weighting (v_diag)
+    OptimizerOptions opt; 
+    opt.max_iters    = 80;
+    // v_diag rows (exactly mirror MATLAB):
+    // per node: first 6 rows -> 1.0; next 3*num_nearestpts rows -> 0.1; data rows -> 0.01
+    opt.w_rot_rows   = 1.0;   // 6 rows (orthogonality)
+    opt.w_conn_rows  = 0.1;   // connection rows
+    opt.w_data_rows  = 0.01;  // data rows
 
-    // 6) Optimize (with MATLAB-style weights) — NOTE: adjust to your chosen scale
-    Optimizer optimizer;
-    Optimizer::Options opts; // initialize defaults
-    opts.max_iters = 80;
-    opts.lambda_init = 1e-4;
-    opts.eps_jac = 1e-7;
-    opts.tol_dx = 1e-6;
-    // Residual-scale weights (sqrt of cost weights)
-    opts.w_data            = 0.1;   // data term (try 10.0 to mimic MATLAB 100 cost weight)
-    opts.w_smooth          = 0.316; // smoothness (try 3.162 for 10)
-    opts.w_ortho           = 0.5;   // orthogonality regularization (try 1.0 for 1)
-    opts.verbose = true;
+    Optimizer solver(opt);
+    solver.optimize(edgraph, x, key_old, key_new, key_indices);
 
-    Eigen::VectorXd x_opt;
-    optimizer.optimize(x0, x_opt, edgraph, key_old, key_new, key_indices, opts);
-
-    // Save x_opt in row-major layout per node (for MATLAB reading)
-    saveVector("x_cpp.txt", x_opt);
-    std::cout << "Saved x_cpp.txt (" << x_opt.size() << " values)\n";
+    // Save state vector for MATLAB inspection (row-major per node)
+    saveVector("x_cpp.txt", x);
+    std::cout << "Saved x_cpp.txt (" << x.size() << " values)\n";
 
     // 7) FINAL metrics
-    double kmean1, krmse1, kmax1; keyErrors(edgraph, key_old, key_new, key_indices, x_opt, kmean1, krmse1, kmax1);
-    double smooth1 = smoothCost(edgraph, x_opt);
+    double kmean1, krmse1, kmax1; keyErrors(edgraph, key_old, key_new, key_indices, x, kmean1, krmse1, kmax1);
+    double smooth1 = smoothCost(edgraph, x);
     std::cout << "[Final]  key_mean=" << kmean1 << "  key_rmse=" << krmse1 << "  key_max=" << kmax1
               << "  smooth_cost=" << smooth1 << "\n";
     std::cout << "[Delta]  key_rmse_drop=" << ((krmse0 - krmse1) / std::max(1e-12, krmse0) * 100.0) << "%"
               << "  smooth_drop=" << (smooth0 - smooth1) << "\n";
 
-    compareToMatlab(x_opt, "[Final-MATLAB]");
-
-    // 8) Save deformed
-    auto deformed = deformAll(edgraph, model.getVertices(), x_opt);
+    // 8) Save deformed points
+    auto deformed = deformAll(edgraph, model.getVertices(), x);
     {
         std::ofstream fout("deformed_cpp.txt");
         for (const auto& p : deformed) fout << p.x() << ' ' << p.y() << ' ' << p.z() << '\n';
         std::cout << "Saved deformed_cpp.txt (" << deformed.size() << " points)\n";
     }
-
-    // Optional PLY
-    auto savePLY = [](const std::string& filename, const std::vector<Vec3>& points) {
-        std::ofstream ofs(filename);
-        if (!ofs.is_open()) { std::cerr << "Failed to open: " << filename << '\n'; return; }
-        ofs << "ply\nformat ascii 1.0\n";
-        ofs << "element vertex " << points.size() << "\n";
-        ofs << "property float x\nproperty float y\nproperty float z\nend_header\n";
-        for (const auto& p : points) ofs << p.x() << ' ' << p.y() << ' ' << p.z() << '\n';
-        std::cout << "Saved PLY: " << filename << '\n';
-    };
-    // savePLY("original.ply", original_points);
-    // savePLY("deformed.ply", deformed);
 
     return 0;
 }
