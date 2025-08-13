@@ -9,8 +9,8 @@ struct OptimizerOptions {
     bool   verbose     = true;
 
     // Line search (match MATLAB script semantics)
-    double alpha0      = 0.5;   // initial step
-    double step0       = 0.25;  // step adjust
+    double alpha0      = 1.0;   // start with full step like MATLAB; backtrack if needed
+    double step0       = 0.25;  // step-size adjust in our simple zoom
     double gamma1      = 0.1;   // Armijo-like
     double gamma2      = 0.9;   // curvature-like
 
@@ -55,5 +55,5 @@ private:
     void numericJacobian(std::function<void(const Eigen::VectorXd&, Eigen::VectorXd&)> f,
                          const Eigen::VectorXd& x,
                          Eigen::MatrixXd& J,
-                         double eps = 1e-6) const;
+                         double eps = 1e-7) const; // slightly smaller step for closer match to MATLAB
 };

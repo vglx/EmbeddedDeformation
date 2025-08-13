@@ -42,7 +42,7 @@ static bool loadInt(const std::string& path, int& out_val) {
 }
 
 static bool saveVector(const std::string& path, const Eigen::VectorXd& x){
-    std::ofstream f(path); if(!f.is_open()) return false; 
+    std::ofstream f(path); if(!f.is_open()) return false;
     for(int i=0;i<x.size();++i){ f << std::setprecision(17) << x[i] << '\n'; }
     return true;
 }
@@ -80,6 +80,23 @@ static void keyErrors(const EDGraph& ed,
     max_e  = mx;
 }
 
+// MATLAB-style sanity check: compare key_old to v_init(key_idx)
+static void checkKeyOldVsVinit(const std::vector<Vec3>& v_init,
+                               const std::vector<Vec3>& key_old,
+                               const std::vector<int>& key_idx) {
+    double sum=0.0, mx=0.0; int N = (int)key_old.size();
+    for (int i=0;i<N;++i) {
+        int vid = key_idx[i];
+        if (vid < 0 || vid >= (int)v_init.size()) continue;
+        double e = (key_old[i] - v_init[vid]).norm();
+        sum += e; mx = std::max(mx, e);
+    }
+    double mean = (N>0)? (sum/N) : 0.0;
+    std::cout << std::fixed << std::setprecision(6)
+              << "[Check] key_old vs v_init(idx): mean=" << mean
+              << "  max=" << mx << "\n";
+}
+
 static double smoothCost(const EDGraph& ed, const Eigen::VectorXd& x) {
     const int G = ed.numNodes();
     const auto& nodes = ed.getGraphNodes();
@@ -106,17 +123,20 @@ static double smoothCost(const EDGraph& ed, const Eigen::VectorXd& x) {
 }
 
 int main(int argc, char** argv) {
+    // Pretty printing similar to MATLAB
+    std::cout.setf(std::ios::fixed);
+
     // 0) Load original vertices (centered)
-    std::vector<Vec3> original_points = loadXYZ("v_init.txt");
-    if (original_points.empty()) {
+    std::vector<Vec3> v_init = loadXYZ("v_init.txt");
+    if (v_init.empty()) {
         std::cerr << "[ERR] v_init.txt missing or empty. Export it from MATLAB after centering vout1." << std::endl;
         return -1;
     }
 
     // 1) Build MeshModel (preserves vertex order)
     MeshModel model;
-    std::vector<MeshModel::Vertex> mesh_vs; mesh_vs.reserve(original_points.size());
-    for (const auto& p : original_points) {
+    std::vector<MeshModel::Vertex> mesh_vs; mesh_vs.reserve(v_init.size());
+    for (const auto& p : v_init) {
         MeshModel::Vertex v; v.x = p.x(); v.y = p.y(); v.z = p.z(); v.nx=v.ny=v.nz=0.0; mesh_vs.push_back(v);
     }
     model.setVertices(mesh_vs);
@@ -166,25 +186,36 @@ int main(int argc, char** argv) {
         }
     }
 
+    // --- MATLAB-style sanity check line ---
+    checkKeyOldVsVinit(v_init, key_old, key_indices);
+
     // 4) Initial state vector x (A=I, t=0 per node)
     const int G = edgraph.numNodes();
     Eigen::VectorXd x(12 * G);
     edgraph.writeToStateVector(x, 0);
 
-    // 5) INITIAL metrics
+    // 5) INITIAL metrics (match MATLAB precision)
     double kmean0, krmse0, kmax0; keyErrors(edgraph, key_old, key_new, key_indices, x, kmean0, krmse0, kmax0);
     double smooth0 = smoothCost(edgraph, x);
-    std::cout << "[Init]   key_mean=" << kmean0 << "  key_rmse=" << krmse0 << "  key_max=" << kmax0
+    std::cout << std::setprecision(6)
+              << "[Init]   key_mean=" << kmean0
+              << "  key_rmse=" << krmse0
+              << "  key_max=" << kmax0
+              << std::setprecision(8)
               << "  smooth_cost=" << smooth0 << "\n";
 
     // 6) Optimize — MATLAB-equivalent P-weighting (v_diag)
     OptimizerOptions opt; 
     opt.max_iters    = 80;
-    // v_diag rows (exactly mirror MATLAB):
-    // per node: first 6 rows -> 1.0; next 3*num_nearestpts rows -> 0.1; data rows -> 0.01
+    // P weights exactly mirror MATLAB v_diag rows:
     opt.w_rot_rows   = 1.0;   // 6 rows (orthogonality)
-    opt.w_conn_rows  = 0.1;   // connection rows
-    opt.w_data_rows  = 0.01;  // data rows
+    opt.w_conn_rows  = 0.1;   // connection rows (per neighbor edge)
+    opt.w_data_rows  = 0.01;  // data rows (3 per key)
+    // Line search params to mimic MATLAB LineSearch
+    opt.alpha0 = 1.0;  // try full step first
+    opt.step0  = 0.25; // adjust step size
+    opt.gamma1 = 0.1;  // Armijo-like
+    opt.gamma2 = 0.9;  // curvature-like
 
     Optimizer solver(opt);
     solver.optimize(edgraph, x, key_old, key_new, key_indices);
@@ -196,9 +227,15 @@ int main(int argc, char** argv) {
     // 7) FINAL metrics
     double kmean1, krmse1, kmax1; keyErrors(edgraph, key_old, key_new, key_indices, x, kmean1, krmse1, kmax1);
     double smooth1 = smoothCost(edgraph, x);
-    std::cout << "[Final]  key_mean=" << kmean1 << "  key_rmse=" << krmse1 << "  key_max=" << kmax1
+    std::cout << std::setprecision(6)
+              << "[Final]  key_mean=" << kmean1
+              << "  key_rmse=" << krmse1
+              << "  key_max=" << kmax1
+              << std::setprecision(8)
               << "  smooth_cost=" << smooth1 << "\n";
-    std::cout << "[Delta]  key_rmse_drop=" << ((krmse0 - krmse1) / std::max(1e-12, krmse0) * 100.0) << "%"
+    double drop = ((krmse0 - krmse1) / std::max(1e-12, krmse0) * 100.0);
+    std::cout << std::setprecision(6)
+              << "[Delta]  key_rmse_drop=" << drop << "%"
               << "  smooth_drop=" << (smooth0 - smooth1) << "\n";
 
     // 8) Save deformed points
