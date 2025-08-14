@@ -5,7 +5,7 @@
 #include "EDGraph.h"
 
 struct OptimizerOptions {
-    int    max_iters   = 50;
+    int    max_iters   = 80;
     bool   verbose     = true;
 
     // Line search (match MATLAB script semantics)
@@ -29,7 +29,7 @@ class Optimizer {
 public:
     explicit Optimizer(const OptimizerOptions& opt);
 
-    // x: 12*G vector, per node (row-major A 9 + t 3)
+    // x: 12*G vector, per node (ROW-MAJOR A 9 + t 3)
     void optimize(EDGraph& edgraph,
                   Eigen::VectorXd& x, // in/out
                   const std::vector<Eigen::Vector3d>& key_old,
@@ -46,14 +46,15 @@ private:
                              const std::vector<Eigen::Vector3d>& key_new,
                              const std::vector<int>& key_idx,
                              Eigen::VectorXd& F,
-                             Eigen::VectorXd& Pdiag,
+                             Eigen::VectorXd& v_diag, // store MATLAB v (NOT its inverse)
                              int& num_rownode,
                              int& num_nodes,
                              int& num_ctrl) const;
 
-    // Numerical Jacobian of full F (central diff)
-    void numericJacobian(std::function<void(const Eigen::VectorXd&, Eigen::VectorXd&)> f,
-                         const Eigen::VectorXd& x,
-                         Eigen::MatrixXd& J,
-                         double eps = 1e-7) const; // slightly smaller step for closer match to MATLAB
+    // Analytic Jacobian (matches MATLAB JacobianF, including 0.6 factors in smoothness)
+    void analyticJacobian(const Eigen::VectorXd& x,
+                          const EDGraph& ed,
+                          const std::vector<Eigen::Vector3d>& key_old,
+                          const std::vector<int>& key_idx,
+                          Eigen::MatrixXd& J) const;
 };
