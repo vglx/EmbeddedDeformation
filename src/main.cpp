@@ -80,7 +80,7 @@ static void keyErrors(const EDGraph& ed,
     max_e  = mx;
 }
 
-// MATLAB-style sanity check: compare key_old to v_init(key_idx)
+// MATLAB-style sanity check
 static void checkKeyOldVsVinit(const std::vector<Vec3>& v_init,
                                const std::vector<Vec3>& key_old,
                                const std::vector<int>& key_idx) {
@@ -123,9 +123,6 @@ static double smoothCost(const EDGraph& ed, const Eigen::VectorXd& x) {
 }
 
 int main(int argc, char** argv) {
-    // Pretty printing similar to MATLAB
-    std::cout.setf(std::ios::fixed);
-
     // 0) Load original vertices (centered)
     std::vector<Vec3> v_init = loadXYZ("v_init.txt");
     if (v_init.empty()) {
@@ -133,7 +130,7 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    // 1) Build MeshModel (preserves vertex order)
+    // 1) Build MeshModel
     MeshModel model;
     std::vector<MeshModel::Vertex> mesh_vs; mesh_vs.reserve(v_init.size());
     for (const auto& p : v_init) {
@@ -147,7 +144,7 @@ int main(int argc, char** argv) {
 
     EDGraph edgraph(/*K=*/K_bind);
 
-    // Prefer MATLAB nodes.txt when available (exact node positions)
+    // Prefer MATLAB nodes.txt when available
     std::vector<Vec3> matlab_nodes = loadXYZ("nodes.txt");
     if (!matlab_nodes.empty()) {
         std::vector<DeformationNode> nodes; nodes.reserve(matlab_nodes.size());
@@ -157,18 +154,12 @@ int main(int argc, char** argv) {
         edgraph.setGraphNodes(nodes);
         edgraph.bindVertices(model.getVertices());
         edgraph.buildKnnNeighbors(Ksmooth);
-        std::cout << "[Nodes] Using MATLAB nodes.txt (" << nodes.size() << ")\n";
+        // （可选）屏蔽多余行，贴近 MATLAB：不打印 [Nodes]/[Config]
     } else {
-        const double grid_size = 20.0; // default matches MATLAB
+        const double grid_size = 20.0;
         edgraph.initializeGraph(model.getVertices(), grid_size);
         edgraph.buildKnnNeighbors(Ksmooth);
-        std::cout << "[Nodes] MATLAB nodes.txt not found. Using voxel init." << "\n";
     }
-
-    std::cout << "[Config] verts=" << model.getVertices().size()
-              << "  nodes=" << edgraph.numNodes()
-              << "  K_bind=" << K_bind
-              << "  Ksmooth=" << Ksmooth << "\n";
 
     // 3) Load MATLAB keypoints and EXACT indices
     std::vector<Vec3> key_old = loadXYZ("key_old.txt");
@@ -194,56 +185,53 @@ int main(int argc, char** argv) {
     Eigen::VectorXd x(12 * G);
     edgraph.writeToStateVector(x, 0);
 
-    // 5) INITIAL metrics (match MATLAB precision)
+    // 5) INITIAL metrics（保持与 MATLAB 小数位）
     double kmean0, krmse0, kmax0; keyErrors(edgraph, key_old, key_new, key_indices, x, kmean0, krmse0, kmax0);
     double smooth0 = smoothCost(edgraph, x);
+    std::cout.setf(std::ios::fixed); // for this line only
     std::cout << std::setprecision(6)
               << "[Init]   key_mean=" << kmean0
               << "  key_rmse=" << krmse0
-              << "  key_max=" << kmax0
-              << std::setprecision(8)
-              << "  smooth_cost=" << smooth0 << "\n";
+              << "  key_max=" << kmax0 << "\n";
+    std::cout.unsetf(std::ios::floatfield);
 
     // 6) Optimize — MATLAB-equivalent P-weighting (v_diag)
     OptimizerOptions opt; 
     opt.max_iters    = 80;
-    // P weights exactly mirror MATLAB v_diag rows:
-    opt.w_rot_rows   = 1.0;   // 6 rows (orthogonality)
-    opt.w_conn_rows  = 0.1;   // connection rows (per neighbor edge)
-    opt.w_data_rows  = 0.01;  // data rows (3 per key)
-    // Line search params to mimic MATLAB LineSearch
+    opt.w_rot_rows   = 1.0;
+    opt.w_conn_rows  = 0.1;
+    opt.w_data_rows  = 0.01;
     opt.alpha0 = 1.0;  // try full step first
     opt.step0  = 0.25; // adjust step size
-    opt.gamma1 = 0.1;  // Armijo-like
-    opt.gamma2 = 0.9;  // curvature-like
+    opt.gamma1 = 0.1;
+    opt.gamma2 = 0.9;
 
     Optimizer solver(opt);
     solver.optimize(edgraph, x, key_old, key_new, key_indices);
 
-    // Save state vector for MATLAB inspection (row-major per node)
+    // Save state vector
     saveVector("x_cpp.txt", x);
-    std::cout << "Saved x_cpp.txt (" << x.size() << " values)\n";
 
-    // 7) FINAL metrics
+    // 7) FINAL metrics（与 MATLAB 小数位靠近）
     double kmean1, krmse1, kmax1; keyErrors(edgraph, key_old, key_new, key_indices, x, kmean1, krmse1, kmax1);
     double smooth1 = smoothCost(edgraph, x);
+    std::cout.setf(std::ios::fixed);
     std::cout << std::setprecision(6)
               << "[Final]  key_mean=" << kmean1
               << "  key_rmse=" << krmse1
-              << "  key_max=" << kmax1
-              << std::setprecision(8)
-              << "  smooth_cost=" << smooth1 << "\n";
+              << "  key_max=" << kmax1 << "\n";
+    std::cout.unsetf(std::ios::floatfield);
     double drop = ((krmse0 - krmse1) / std::max(1e-12, krmse0) * 100.0);
+    std::cout.setf(std::ios::fixed);
     std::cout << std::setprecision(6)
-              << "[Delta]  key_rmse_drop=" << drop << "%"
-              << "  smooth_drop=" << (smooth0 - smooth1) << "\n";
+              << "[Delta]  key_rmse_drop=" << drop << "%" << "\n";
+    std::cout.unsetf(std::ios::floatfield);
 
-    // 8) Save deformed points
+    // 8) Save deformed points（可留，可去）
     auto deformed = deformAll(edgraph, model.getVertices(), x);
     {
         std::ofstream fout("deformed_cpp.txt");
         for (const auto& p : deformed) fout << p.x() << ' ' << p.y() << ' ' << p.z() << '\n';
-        std::cout << "Saved deformed_cpp.txt (" << deformed.size() << " points)\n";
     }
 
     return 0;

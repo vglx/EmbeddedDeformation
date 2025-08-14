@@ -4,6 +4,7 @@
 #include <tuple>
 #include <iomanip>
 #include <limits>
+#include <sstream>
 
 using Vec3 = Eigen::Vector3d;
 
@@ -34,12 +35,12 @@ void Optimizer::buildResidualVector(const Eigen::VectorXd& x,
 
     // Deduce K from neighbors: size(neigh[i]) = num_nearestpts-1 typically
     const int num_nearestpts = (int)neigh.empty() ? 1 : ((int)neigh[0].size() + 1);
-    // Note: per node rows actually = 6 + 3*neigh[i].size(). num_rownode is for logging layout only
+    // Note: per node rows actually = 6 + 3*neigh[i].size(). num_rownode is only for "layout" like MATLAB
     num_rownode = 6 + 3 * num_nearestpts; // mirrors MATLAB intent (K includes self)
 
     Kc = (int)key_old.size();
 
-    // Compute total rows: rotation (6 per node) + smoothness (3*|neigh[i]| per node) + data (3*Kc)
+    // total rows
     int total_rows = 0;
     for (int i = 0; i < G; ++i) total_rows += 6 + 3 * (int)neigh[i].size();
     total_rows += 3 * Kc;
@@ -61,7 +62,6 @@ void Optimizer::buildResidualVector(const Eigen::VectorXd& x,
         F[row+5] = c2.squaredNorm() - 1.0;
         for (int k=0;k<6;++k) Pdiag[row+k] = opt_.w_rot_rows;
         row += 6;
-
         // smoothness residuals: double-count i->j as per MATLAB traversal
         for (int j : neigh[i]) {
             Eigen::Matrix3d Aj; Vec3 tj; unpackA_t(x, j, Aj, tj);
@@ -116,14 +116,13 @@ struct RawBreakdown {
 
 // Compute MATLAB-style raw-cost breakdown and weighted cost/2
 static RawBreakdown compute_breakdown(const Eigen::VectorXd& F,
-                                      const Eigen::VectorXd& v_diag, // Pdiag here stores v (not its inverse)
+                                      const Eigen::VectorXd& v_diag, // v (not inverse)
                                       const EDGraph& ed)
 {
     RawBreakdown R;
     const auto& neigh = ed.getNodeNeighbors();
     const int G = (int)neigh.size();
 
-    // Sum per-node: 6 ortho + 3*|neigh[i]| smooth
     int row = 0;
     for (int i = 0; i < G; ++i) {
         R.ortho  += 0.5 * F.segment<6>(row).squaredNorm();
@@ -135,7 +134,6 @@ static RawBreakdown compute_breakdown(const Eigen::VectorXd& F,
         }
     }
 
-    // data part
     const int len_data = (int)F.size() - row;
     if (len_data > 0) {
         R.data = 0.5 * F.tail(len_data).squaredNorm();
@@ -150,10 +148,13 @@ static RawBreakdown compute_breakdown(const Eigen::VectorXd& F,
     }
 
     R.cost_raw   = R.ortho + R.smooth + R.data;
-    // weighted cost: 0.5 * sum_i F_i^2 / v_i (since v_diag stores MATLAB v)
-    R.cost_P_half = 0.5 * F.cwiseQuotient(v_diag).dot(F);
+    R.cost_P_half = 0.5 * F.cwiseQuotient(v_diag).dot(F); // 0.5 * sum F_i^2 / v_i
     return R;
 }
+
+// helpers to mimic MATLAB's %.6g / %.3e formatting regardless of global iostream flags
+static std::string fmt_g6(double v){ std::ostringstream ss; ss.setf(std::ios::fmtflags(0), std::ios::floatfield); ss<<std::setprecision(6)<<v; return ss.str(); }
+static std::string fmt_e3(double v){ std::ostringstream ss; ss<<std::scientific<<std::setprecision(3)<<v; return ss.str(); }
 }
 
 void Optimizer::optimize(EDGraph& edgraph,
@@ -165,25 +166,18 @@ void Optimizer::optimize(EDGraph& edgraph,
     auto buildF = [&](const Eigen::VectorXd& xt, Eigen::VectorXd& Fout, Eigen::VectorXd& Pdiag){
         int nrn, G, Kc; buildResidualVector(xt, edgraph, key_old, key_new, key_indices, Fout, Pdiag, nrn, G, Kc);
     };
-    auto phi = [&](const Eigen::VectorXd& F, const Eigen::VectorXd& vdiag){
-        // cost = F' * inv(diag(v_diag)) * F
-        return F.cwiseQuotient(vdiag).dot(F);
-    };
+    auto phi = [&](const Eigen::VectorXd& F, const Eigen::VectorXd& vdiag){ return F.cwiseQuotient(vdiag).dot(F); };
 
-    // initial F, J, H, g, cost
     Eigen::VectorXd F, v_diag; buildF(x, F, v_diag);
 
-    // MATLAB-style init logs
     if (opt_.verbose) {
         auto R0 = compute_breakdown(F, v_diag, edgraph);
-        std::cout << std::setprecision(7)
-                  << "[Init]   key_mean=" << R0.key_mean
-                  << "  key_rmse=" << R0.key_rmse
-                  << "  key_max="  << R0.key_max << "\n";
-        std::cout << std::setprecision(12)
-                  << "[GN it=0] cost(raw)=" << R0.cost_raw
-                  << "  (data=" << R0.data << ", smooth=" << R0.smooth << ", ortho=" << R0.ortho << ")"
-                  << "  |dx|=n/a  ||F||_P^2/2=" << R0.cost_P_half << "\n";
+        std::cout << "[Init]   key_mean=" << fmt_g6(R0.key_mean)
+                  << "  key_rmse=" << fmt_g6(R0.key_rmse)
+                  << "  key_max="  << fmt_g6(R0.key_max) << "\n";
+        std::cout << "[GN it=0] cost(raw)=" << fmt_g6(R0.cost_raw)
+                  << "  (data=" << fmt_g6(R0.data) << ", smooth=" << fmt_g6(R0.smooth) << ", ortho=" << fmt_g6(R0.ortho) << ")"
+                  << "  |dx|=n/a  ||F||_P^2/2=" << fmt_g6(R0.cost_P_half) << "\n";
     }
 
     auto Ffun = [&](const Eigen::VectorXd& xt, Eigen::VectorXd& Fout){ Eigen::VectorXd P; buildF(xt, Fout, P); };
@@ -199,20 +193,15 @@ void Optimizer::optimize(EDGraph& edgraph,
     };
 
     Eigen::MatrixXd H; Eigen::VectorXd g; double cost; std::tie(H,g,cost) = assemble(J,F,v_diag);
-    if (opt_.verbose) std::cout << "[GN] init cost=" << std::setprecision(12) << (0.5*cost)
-                                 << "  n=" << x.size() << "  m=" << F.size() << "\n";
+    // 移除 "[GN] init cost=..." 这一行，完全用 MATLAB 风格
 
     double prev_cost = 1e300;
     int it = 0;
     for (; it < opt_.max_iters; ++it) {
-        // Gauss-Newton direction: d = -(J' P J)^{-1} J' P F
         Eigen::VectorXd d = H.ldlt().solve(-g);
 
-        // Line search (MATLAB-like)
-        const double phi0 = cost;
-        const double phi0_deriv = d.dot(g); // since g = J' P F
-        double alpha = opt_.alpha0;
-        double step  = opt_.step0;
+        const double phi0 = cost; const double phi0_deriv = d.dot(g);
+        double alpha = opt_.alpha0, step = opt_.step0;
 
         auto eval_at = [&](double a){
             Eigen::VectorXd xt = x + a * d;
@@ -237,50 +226,36 @@ void Optimizer::optimize(EDGraph& edgraph,
             if (alpha <= 1e-12) break;
             ++k;
         }
+        if (!ok) { if (opt_.verbose) std::cout << "[GN it=" << it << "] line-search failed, alpha->0\n"; break; }
 
-        if (!ok) {
-            if (opt_.verbose) std::cout << "[GN] it=" << it << "  line-search failed, alpha→0\n";
-            break;
-        }
+        x += alpha * d; F.swap(Fa); v_diag.swap(Pa); J.swap(Ja); cost = phia;
 
-        // Accept step
-        x += alpha * d;
-        F.swap(Fa); v_diag.swap(Pa); J.swap(Ja); cost = phia;
-
-        // MATLAB-style per-iteration print (use it+1 to match script's first update)
         if (opt_.verbose) {
             auto R = compute_breakdown(F, v_diag, edgraph);
-            std::cout << std::setprecision(8)
-                      << "[GN it=" << (it+1) << "] cost(raw)=" << R.cost_raw
-                      << "  (data=" << R.data << ", smooth=" << R.smooth << ", ortho=" << R.ortho << ")"
-                      << "  |dx|=" << d.norm()
-                      << "  ||F||_P^2/2=" << std::setprecision(12) << R.cost_P_half
-                      << "  [key mean=" << std::setprecision(8) << R.key_mean
-                      << " rmse=" << R.key_rmse
-                      << " max=" << R.key_max << "]\n";
+            std::cout << "[GN it=" << (it+1) << "] cost(raw)=" << fmt_g6(R.cost_raw)
+                      << "  (data=" << fmt_g6(R.data) << ", smooth=" << fmt_g6(R.smooth) << ", ortho=" << fmt_g6(R.ortho) << ")"
+                      << "  |dx|=" << fmt_e3(d.norm())
+                      << "  ||F||_P^2/2=" << fmt_g6(R.cost_P_half)
+                      << "  [key mean=" << fmt_g6(R.key_mean)
+                      << " rmse=" << fmt_g6(R.key_rmse)
+                      << " max=" << fmt_g6(R.key_max) << "]\n";
         }
 
-        // Convergence checks (match MATLAB spirit)
         if (0.5*cost < opt_.tol_cost) break;
         if (std::abs(prev_cost - cost) < opt_.tol_cost) break;
         prev_cost = cost;
 
-        // Recompute H,g at new x
-        {
-            Eigen::VectorXd inv_v = v_diag.cwiseInverse();
-            Eigen::MatrixXd JP = J.transpose() * inv_v.asDiagonal();
-            H  = JP * J;
-            g  = JP * F;
-        }
+        Eigen::VectorXd inv_v = v_diag.cwiseInverse();
+        Eigen::MatrixXd JP = J.transpose() * inv_v.asDiagonal();
+        H  = JP * J; g  = JP * F;
     }
 
     if (opt_.verbose) {
         auto Rf = compute_breakdown(F, v_diag, edgraph);
-        std::cout << "[GN] finished iters=" << it << "  final cost=" << std::setprecision(12) << (0.5*cost) << "\n";
-        std::cout << std::setprecision(8)
-                  << "[Final]  key_mean=" << Rf.key_mean
-                  << "  key_rmse=" << Rf.key_rmse
-                  << "  key_max="  << Rf.key_max << "\n";
+        std::cout << "[GN] finished iters=" << it << "  final cost=" << fmt_g6(0.5*cost) << "\n";
+        std::cout << "[Final]  key_mean=" << fmt_g6(Rf.key_mean)
+                  << "  key_rmse=" << fmt_g6(Rf.key_rmse)
+                  << "  key_max="  << fmt_g6(Rf.key_max) << "\n";
     }
 
     edgraph.updateFromStateVector(x, 0);
